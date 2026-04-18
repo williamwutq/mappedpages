@@ -54,6 +54,8 @@ mod error;
 mod meta;
 mod page;
 mod pager;
+#[cfg(test)]
+mod tests;
 
 pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};

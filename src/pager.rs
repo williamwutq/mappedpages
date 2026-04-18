@@ -194,6 +194,17 @@ impl Pager {
         self.meta.total_pages
     }
 
+    /// Number of pages currently available for allocation.
+    pub fn free_page_count(&self) -> u64 {
+        self.meta.free_count
+    }
+
+    /// Which metadata selector is currently active (test-only introspection).
+    #[cfg(test)]
+    pub(crate) fn active_meta_selector(&self) -> MetaSelector {
+        self.active_meta
+    }
+
     // ── Page access (called by PageId) ────────────────────────────────────────
 
     pub(crate) fn get_page(&self, id: PageId) -> Result<&MappedPage, MappedPageError> {
