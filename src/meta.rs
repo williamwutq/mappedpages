@@ -175,13 +175,16 @@ impl MetaPage {
     pub(crate) fn alloc_page(&mut self) -> Option<u64> {
         for (byte_idx, byte) in self.bitmap.iter_mut().enumerate() {
             if *byte != 0xff {
-                let bit = byte.trailing_ones() as u64;
-                *byte |= 1 << bit;
-                let page_id = byte_idx as u64 * 8 + bit;
-                if page_id < self.total_pages {
-                    self.free_count = self.free_count.saturating_sub(1);
-                    return Some(page_id);
+                let bit = byte.trailing_ones();
+                let page_id = byte_idx as u64 * 8 + bit as u64;
+                // Check bounds before modifying: trailing bits beyond total_pages
+                // are kept zero but are not valid pages.
+                if page_id >= self.total_pages {
+                    break;
                 }
+                *byte |= 1 << bit;
+                self.free_count = self.free_count.saturating_sub(1);
+                return Some(page_id);
             }
         }
         None
