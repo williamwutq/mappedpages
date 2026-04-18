@@ -11,3 +11,5 @@ documentation = "https://docs.rs/mappedpages"
 keywords = ["memory-mapping", "allocator", "storage", "pages", "fixed-size"]
 
 [dependencies]
+memmap2 = "0.9"
+crc32fast = "1"
