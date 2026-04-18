@@ -32,8 +32,14 @@ pub(crate) const VERSION_PATCH: u8 = 0;
 pub(crate) const VERSION_BUILD: u8 = 0;
 /// Full magic for files written by this build: `"MPPG"` + `[major, minor, patch, build]`.
 pub(crate) const MAGIC: u64 = u64::from_le_bytes([
-    b'M', b'P', b'P', b'G',
-    VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, VERSION_BUILD,
+    b'M',
+    b'P',
+    b'P',
+    b'G',
+    VERSION_MAJOR,
+    VERSION_MINOR,
+    VERSION_PATCH,
+    VERSION_BUILD,
 ]);
 /// First page index that may be returned to callers (pages 0-2 are reserved).
 pub(crate) const FIRST_DATA_PAGE: u64 = 3;
@@ -107,7 +113,12 @@ impl Superblock {
         let page_size_log2 = u32::from_le_bytes(data[8..12].try_into().ok()?);
         let active_meta = MetaSelector::from_byte(data[12])?;
         let meta_checksum = u32::from_le_bytes(data[16..20].try_into().ok()?);
-        Some(Superblock { magic, page_size_log2, active_meta, meta_checksum })
+        Some(Superblock {
+            magic,
+            page_size_log2,
+            active_meta,
+            meta_checksum,
+        })
     }
 
     pub(crate) fn write_to(&self, buf: &mut [u8]) {
@@ -148,7 +159,12 @@ impl MetaPage {
             return None;
         }
         let bitmap = data[24..bitmap_end].to_vec();
-        Some(MetaPage { total_pages, generation, free_count, bitmap })
+        Some(MetaPage {
+            total_pages,
+            generation,
+            free_count,
+            bitmap,
+        })
     }
 
     /// Serialize into a raw page slice.
@@ -215,7 +231,12 @@ impl MetaPage {
             bitmap[(reserved / 8) as usize] |= 1 << (reserved % 8);
         }
         let free_count = total_pages.saturating_sub(FIRST_DATA_PAGE);
-        MetaPage { total_pages, generation: 0, free_count, bitmap }
+        MetaPage {
+            total_pages,
+            generation: 0,
+            free_count,
+            bitmap,
+        }
     }
 
     /// Grow this metadata to cover `new_total_pages`, extending the bitmap.

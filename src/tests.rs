@@ -3,7 +3,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::meta::{MetaPage, MetaSelector, Superblock, FIRST_DATA_PAGE, MAGIC};
+use crate::meta::{FIRST_DATA_PAGE, MAGIC, MetaPage, MetaSelector, Superblock};
 use crate::{MappedPageError, PageId, Pager};
 
 // ── Temp-file helper ──────────────────────────────────────────────────────────
@@ -119,7 +119,7 @@ fn meta_double_free_returns_false_no_undercount() {
 #[test]
 fn meta_free_out_of_range_returns_false() {
     let mut m = MetaPage::new_for_capacity(8);
-    assert!(!m.free_page(8));   // == total_pages
+    assert!(!m.free_page(8)); // == total_pages
     assert!(!m.free_page(100));
     assert_eq!(m.free_count, 5); // unchanged
 }
@@ -224,14 +224,24 @@ fn superblock_roundtrip() {
 
 #[test]
 fn superblock_is_valid_correct_magic() {
-    let sb = Superblock { magic: MAGIC, page_size_log2: 10, active_meta: MetaSelector::A, meta_checksum: 0 };
+    let sb = Superblock {
+        magic: MAGIC,
+        page_size_log2: 10,
+        active_meta: MetaSelector::A,
+        meta_checksum: 0,
+    };
     assert!(sb.is_valid());
 }
 
 #[test]
 fn superblock_wrong_magic_tag_invalid() {
     let bad = u64::from_le_bytes(*b"BADMAGIC");
-    let sb = Superblock { magic: bad, page_size_log2: 10, active_meta: MetaSelector::A, meta_checksum: 0 };
+    let sb = Superblock {
+        magic: bad,
+        page_size_log2: 10,
+        active_meta: MetaSelector::A,
+        meta_checksum: 0,
+    };
     assert!(!sb.is_valid());
 }
 
@@ -239,7 +249,12 @@ fn superblock_wrong_magic_tag_invalid() {
 fn superblock_wrong_major_invalid() {
     let mut b = MAGIC.to_le_bytes();
     b[4] = 99;
-    let sb = Superblock { magic: u64::from_le_bytes(b), page_size_log2: 10, active_meta: MetaSelector::A, meta_checksum: 0 };
+    let sb = Superblock {
+        magic: u64::from_le_bytes(b),
+        page_size_log2: 10,
+        active_meta: MetaSelector::A,
+        meta_checksum: 0,
+    };
     assert!(!sb.is_valid());
 }
 
@@ -247,16 +262,26 @@ fn superblock_wrong_major_invalid() {
 fn superblock_wrong_minor_invalid() {
     let mut b = MAGIC.to_le_bytes();
     b[5] = 99;
-    let sb = Superblock { magic: u64::from_le_bytes(b), page_size_log2: 10, active_meta: MetaSelector::A, meta_checksum: 0 };
+    let sb = Superblock {
+        magic: u64::from_le_bytes(b),
+        page_size_log2: 10,
+        active_meta: MetaSelector::A,
+        meta_checksum: 0,
+    };
     assert!(!sb.is_valid());
 }
 
 #[test]
 fn superblock_different_patch_and_build_still_valid() {
     let mut b = MAGIC.to_le_bytes();
-    b[6] = 7;  // different patch
+    b[6] = 7; // different patch
     b[7] = 99; // different build
-    let sb = Superblock { magic: u64::from_le_bytes(b), page_size_log2: 10, active_meta: MetaSelector::A, meta_checksum: 0 };
+    let sb = Superblock {
+        magic: u64::from_le_bytes(b),
+        page_size_log2: 10,
+        active_meta: MetaSelector::A,
+        meta_checksum: 0,
+    };
     assert!(sb.is_valid()); // patch/build not checked for compatibility
 }
 
@@ -287,7 +312,10 @@ fn pager_create_larger_page_size() {
 fn pager_create_page_size_too_small() {
     let tmp = TempPath::new();
     for log2 in [0u32, 5, 9] {
-        assert!(matches!(Pager::create(tmp.path(), log2), Err(MappedPageError::InvalidPageSize)));
+        assert!(matches!(
+            Pager::create(tmp.path(), log2),
+            Err(MappedPageError::InvalidPageSize)
+        ));
     }
 }
 
@@ -295,13 +323,19 @@ fn pager_create_page_size_too_small() {
 fn pager_create_existing_file_fails() {
     let tmp = TempPath::new();
     Pager::create(tmp.path(), 10).unwrap();
-    assert!(matches!(Pager::create(tmp.path(), 10), Err(MappedPageError::Io(_))));
+    assert!(matches!(
+        Pager::create(tmp.path(), 10),
+        Err(MappedPageError::Io(_))
+    ));
 }
 
 #[test]
 fn pager_open_nonexistent_fails() {
     let tmp = TempPath::new();
-    assert!(matches!(Pager::open(tmp.path()), Err(MappedPageError::Io(_))));
+    assert!(matches!(
+        Pager::open(tmp.path()),
+        Err(MappedPageError::Io(_))
+    ));
 }
 
 #[test]
@@ -319,7 +353,10 @@ fn pager_alloc_returns_data_page() {
     let tmp = TempPath::new();
     let mut p = Pager::create(tmp.path(), 10).unwrap();
     let id = p.alloc().unwrap();
-    assert!(id.0 >= FIRST_DATA_PAGE, "alloc must not return reserved pages");
+    assert!(
+        id.0 >= FIRST_DATA_PAGE,
+        "alloc must not return reserved pages"
+    );
 }
 
 #[test]
@@ -352,10 +389,14 @@ fn pager_page_count_doubles_each_grow() {
     let tmp = TempPath::new();
     let mut p = Pager::create(tmp.path(), 10).unwrap();
     // exhaust and grow twice
-    while p.free_page_count() > 0 { p.alloc().unwrap(); }
+    while p.free_page_count() > 0 {
+        p.alloc().unwrap();
+    }
     p.alloc().unwrap(); // grow 4 → 8
     assert_eq!(p.page_count(), 8);
-    while p.free_page_count() > 0 { p.alloc().unwrap(); }
+    while p.free_page_count() > 0 {
+        p.alloc().unwrap();
+    }
     p.alloc().unwrap(); // grow 8 → 16
     assert_eq!(p.page_count(), 16);
 }
@@ -377,7 +418,10 @@ fn pager_free_reserved_pages_error() {
     let tmp = TempPath::new();
     let mut p = Pager::create(tmp.path(), 10).unwrap();
     for i in 0..FIRST_DATA_PAGE {
-        assert!(matches!(p.free(PageId(i)), Err(MappedPageError::ReservedPage)));
+        assert!(matches!(
+            p.free(PageId(i)),
+            Err(MappedPageError::ReservedPage)
+        ));
     }
 }
 
@@ -385,8 +429,14 @@ fn pager_free_reserved_pages_error() {
 fn pager_free_out_of_bounds_error() {
     let tmp = TempPath::new();
     let mut p = Pager::create(tmp.path(), 10).unwrap();
-    assert!(matches!(p.free(PageId(4)), Err(MappedPageError::OutOfBounds)));
-    assert!(matches!(p.free(PageId(u64::MAX)), Err(MappedPageError::OutOfBounds)));
+    assert!(matches!(
+        p.free(PageId(4)),
+        Err(MappedPageError::OutOfBounds)
+    ));
+    assert!(matches!(
+        p.free(PageId(u64::MAX)),
+        Err(MappedPageError::OutOfBounds)
+    ));
 }
 
 #[test]
@@ -404,7 +454,10 @@ fn pager_get_page_reserved_error() {
     let tmp = TempPath::new();
     let p = Pager::create(tmp.path(), 10).unwrap();
     for i in 0..FIRST_DATA_PAGE {
-        assert!(matches!(PageId(i).get(&p), Err(MappedPageError::ReservedPage)));
+        assert!(matches!(
+            PageId(i).get(&p),
+            Err(MappedPageError::ReservedPage)
+        ));
     }
 }
 
@@ -412,8 +465,14 @@ fn pager_get_page_reserved_error() {
 fn pager_get_page_out_of_bounds_error() {
     let tmp = TempPath::new();
     let p = Pager::create(tmp.path(), 10).unwrap();
-    assert!(matches!(PageId(4).get(&p), Err(MappedPageError::OutOfBounds)));
-    assert!(matches!(PageId(u64::MAX).get(&p), Err(MappedPageError::OutOfBounds)));
+    assert!(matches!(
+        PageId(4).get(&p),
+        Err(MappedPageError::OutOfBounds)
+    ));
+    assert!(matches!(
+        PageId(u64::MAX).get(&p),
+        Err(MappedPageError::OutOfBounds)
+    ));
 }
 
 #[test]
@@ -521,7 +580,10 @@ fn crash_both_meta_corrupt_returns_error() {
     Pager::create(tmp.path(), 10).unwrap();
     zero_range(tmp.path(), meta_checksum_offset(MetaSelector::A, 1024), 4);
     zero_range(tmp.path(), meta_checksum_offset(MetaSelector::B, 1024), 4);
-    assert!(matches!(Pager::open(tmp.path()), Err(MappedPageError::CorruptMetadata)));
+    assert!(matches!(
+        Pager::open(tmp.path()),
+        Err(MappedPageError::CorruptMetadata)
+    ));
 }
 
 #[test]
@@ -529,7 +591,10 @@ fn crash_corrupt_superblock_magic() {
     let tmp = TempPath::new();
     Pager::create(tmp.path(), 10).unwrap();
     zero_range(tmp.path(), 0, 8); // zero the magic bytes
-    assert!(matches!(Pager::open(tmp.path()), Err(MappedPageError::CorruptSuperblock)));
+    assert!(matches!(
+        Pager::open(tmp.path()),
+        Err(MappedPageError::CorruptSuperblock)
+    ));
 }
 
 #[test]
@@ -537,7 +602,10 @@ fn crash_corrupt_superblock_version_major() {
     let tmp = TempPath::new();
     Pager::create(tmp.path(), 10).unwrap();
     write_at(tmp.path(), 4, &[0xFF]); // byte 4 = version major
-    assert!(matches!(Pager::open(tmp.path()), Err(MappedPageError::CorruptSuperblock)));
+    assert!(matches!(
+        Pager::open(tmp.path()),
+        Err(MappedPageError::CorruptSuperblock)
+    ));
 }
 
 #[test]
@@ -545,7 +613,10 @@ fn crash_corrupt_superblock_selector_byte() {
     let tmp = TempPath::new();
     Pager::create(tmp.path(), 10).unwrap();
     write_at(tmp.path(), 12, &[0xFF]); // byte 12 = active_meta; 0xFF is invalid
-    assert!(matches!(Pager::open(tmp.path()), Err(MappedPageError::CorruptSuperblock)));
+    assert!(matches!(
+        Pager::open(tmp.path()),
+        Err(MappedPageError::CorruptSuperblock)
+    ));
 }
 
 #[test]

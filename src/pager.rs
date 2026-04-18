@@ -6,9 +6,7 @@ use std::path::Path;
 use memmap2::MmapMut;
 
 use crate::error::MappedPageError;
-use crate::meta::{
-    MetaPage, MetaSelector, Superblock, FIRST_DATA_PAGE, MAGIC, MIN_PAGE_SIZE_LOG2,
-};
+use crate::meta::{FIRST_DATA_PAGE, MAGIC, MIN_PAGE_SIZE_LOG2, MetaPage, MetaSelector, Superblock};
 use crate::page::{MappedPage, PageId};
 
 /// Manages a memory-mapped, fixed-size-page file.
@@ -91,7 +89,13 @@ impl Pager {
 
         mmap.flush()?;
 
-        Ok(Pager { file, mmap: Some(mmap), page_size, active_meta: MetaSelector::A, meta })
+        Ok(Pager {
+            file,
+            mmap: Some(mmap),
+            page_size,
+            active_meta: MetaSelector::A,
+            meta,
+        })
     }
 
     /// Open an existing pager file, validating and recovering metadata.
@@ -130,8 +134,7 @@ impl Pager {
         let active_opt: Option<MetaPage> = {
             let off = active.page_id() as usize * page_size;
             let page = &mmap[off..off + page_size];
-            MetaPage::from_bytes(page)
-                .filter(|_| MetaPage::page_checksum(page) == sb.meta_checksum)
+            MetaPage::from_bytes(page).filter(|_| MetaPage::page_checksum(page) == sb.meta_checksum)
         };
 
         // Fall back to the alternate page: internal checksum only.
@@ -144,7 +147,13 @@ impl Pager {
             (m, alt)
         };
 
-        Ok(Pager { file, mmap: Some(mmap), page_size, active_meta, meta })
+        Ok(Pager {
+            file,
+            mmap: Some(mmap),
+            page_size,
+            active_meta,
+            meta,
+        })
     }
 
     // ── Allocation ────────────────────────────────────────────────────────────
@@ -298,8 +307,7 @@ impl Pager {
 
         if let Err(e) = self.file.set_len(new_file_size) {
             // File size unchanged; restore the mapping at original size.
-            self.mmap = Some(unsafe { MmapMut::map_mut(&self.file) }
-                .map_err(MappedPageError::Io)?);
+            self.mmap = Some(unsafe { MmapMut::map_mut(&self.file) }.map_err(MappedPageError::Io)?);
             return Err(MappedPageError::Io(e));
         }
 
