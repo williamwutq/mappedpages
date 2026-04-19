@@ -3,8 +3,11 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::meta::{FIRST_DATA_PAGE, MAGIC, MetaPage, MetaSelector, Superblock};
-use crate::{MappedPageError, PageId, Pager};
+use crate::meta::{
+    DirBlockRef, DirEntry, DirPage, FIRST_DATA_PAGE, MAGIC, MetaPage, MetaSelector, Superblock,
+    dir_entries_per_page, read_dir_blocks, write_dir_blocks,
+};
+use crate::{MappedPageError, PageId, Pager, ProtectedPageId};
 
 // ── Temp-file helper ──────────────────────────────────────────────────────────
 
@@ -730,4 +733,605 @@ fn crash_multiple_grows_survive_reopen() {
     assert_eq!(p.page_count(), 16);
     let last_id = PageId(FIRST_DATA_PAGE + alloc_count as u64 - 1);
     assert_eq!(last_id.get(&p).unwrap().as_bytes()[0], 0xBB);
+}
+
+// ── DirPage unit tests ────────────────────────────────────────────────────────
+
+#[test]
+fn dir_page_new_empty_has_correct_capacity() {
+    let dp = DirPage::new_empty(1024);
+    let expected = dir_entries_per_page(1024) as u32;
+    assert_eq!(dp.capacity, expected);
+    assert_eq!(dp.entries.len(), expected as usize);
+    assert!(dp.entries.iter().all(|e| !e.in_use));
+}
+
+#[test]
+fn dir_page_roundtrip_empty() {
+    let dp = DirPage::new_empty(1024);
+    let mut buf = vec![0u8; 1024];
+    dp.write_to(&mut buf);
+    let rt = DirPage::from_bytes(&buf).expect("roundtrip failed");
+    assert_eq!(rt.capacity, dp.capacity);
+    assert_eq!(rt.entries.len(), dp.entries.len());
+    assert!(rt.entries.iter().all(|e| !e.in_use));
+}
+
+#[test]
+fn dir_page_roundtrip_with_entries() {
+    let mut dp = DirPage::new_empty(1024);
+    dp.entries[0] = DirEntry {
+        in_use: true,
+        page_a: 5,
+        page_b: 6,
+        active_slot: 1,
+        generation: 42,
+        checksum: 0xDEAD_BEEF,
+    };
+    dp.entries[2] = DirEntry {
+        in_use: true,
+        page_a: 100,
+        page_b: 101,
+        active_slot: 0,
+        generation: 7,
+        checksum: 0x1234_5678,
+    };
+    let mut buf = vec![0u8; 1024];
+    dp.write_to(&mut buf);
+    let rt = DirPage::from_bytes(&buf).unwrap();
+    assert!(rt.entries[0].in_use);
+    assert_eq!(rt.entries[0].page_a, 5);
+    assert_eq!(rt.entries[0].page_b, 6);
+    assert_eq!(rt.entries[0].active_slot, 1);
+    assert_eq!(rt.entries[0].generation, 42);
+    assert_eq!(rt.entries[0].checksum, 0xDEAD_BEEF);
+    assert!(!rt.entries[1].in_use);
+    assert!(rt.entries[2].in_use);
+    assert_eq!(rt.entries[2].page_a, 100);
+}
+
+#[test]
+fn dir_page_bad_checksum_rejected() {
+    let dp = DirPage::new_empty(1024);
+    let mut buf = vec![0u8; 1024];
+    dp.write_to(&mut buf);
+    *buf.last_mut().unwrap() ^= 0xFF;
+    assert!(DirPage::from_bytes(&buf).is_none());
+}
+
+#[test]
+fn dir_page_too_short_rejected() {
+    assert!(DirPage::from_bytes(&[0u8; 11]).is_none());
+}
+
+#[test]
+fn dir_page_roundtrip_4096() {
+    let dp = DirPage::new_empty(4096);
+    let expected_cap = dir_entries_per_page(4096) as u32;
+    assert!(expected_cap > dir_entries_per_page(1024) as u32);
+    let mut buf = vec![0u8; 4096];
+    dp.write_to(&mut buf);
+    let rt = DirPage::from_bytes(&buf).unwrap();
+    assert_eq!(rt.capacity, expected_cap);
+}
+
+// ── read_dir_blocks / write_dir_blocks unit tests ─────────────────────────────
+
+#[test]
+fn dir_blocks_empty_roundtrip() {
+    let mut page0 = vec![0u8; 1024];
+    write_dir_blocks(&[], &mut page0);
+    let result = read_dir_blocks(&page0).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn dir_blocks_old_format_zeros_accepted() {
+    // Old file: bytes 20..page_size are all zero → count == 0 → no dir blocks.
+    let page0 = vec![0u8; 1024];
+    let result = read_dir_blocks(&page0).unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn dir_blocks_roundtrip_one_block() {
+    let blocks = vec![DirBlockRef {
+        page_a: 3,
+        page_b: 4,
+        active: MetaSelector::B,
+    }];
+    let mut page0 = vec![0u8; 1024];
+    write_dir_blocks(&blocks, &mut page0);
+    let rt = read_dir_blocks(&page0).unwrap();
+    assert_eq!(rt.len(), 1);
+    assert_eq!(rt[0].page_a, 3);
+    assert_eq!(rt[0].page_b, 4);
+    assert_eq!(rt[0].active, MetaSelector::B);
+}
+
+#[test]
+fn dir_blocks_roundtrip_multiple_blocks() {
+    let blocks = vec![
+        DirBlockRef {
+            page_a: 3,
+            page_b: 4,
+            active: MetaSelector::A,
+        },
+        DirBlockRef {
+            page_a: 10,
+            page_b: 11,
+            active: MetaSelector::B,
+        },
+        DirBlockRef {
+            page_a: 20,
+            page_b: 21,
+            active: MetaSelector::A,
+        },
+    ];
+    let mut page0 = vec![0u8; 1024];
+    write_dir_blocks(&blocks, &mut page0);
+    let rt = read_dir_blocks(&page0).unwrap();
+    assert_eq!(rt.len(), 3);
+    assert_eq!(rt[1].page_a, 10);
+    assert_eq!(rt[2].active, MetaSelector::A);
+}
+
+#[test]
+fn dir_blocks_bad_checksum_rejected() {
+    let blocks = vec![DirBlockRef {
+        page_a: 3,
+        page_b: 4,
+        active: MetaSelector::A,
+    }];
+    let mut page0 = vec![0u8; 1024];
+    write_dir_blocks(&blocks, &mut page0);
+    let len = page0.len();
+    page0[len - 1] ^= 0xFF; // corrupt dir section checksum
+    assert!(read_dir_blocks(&page0).is_err());
+}
+
+// ── Protected-page integration tests ─────────────────────────────────────────
+
+#[test]
+fn protected_alloc_returns_id() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+    assert_eq!(id.0, 0);
+}
+
+#[test]
+fn protected_alloc_multiple_distinct_sequential_ids() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let ids: Vec<u64> = (0..4).map(|_| p.alloc_protected().unwrap().0).collect();
+    assert_eq!(ids, [0, 1, 2, 3]);
+}
+
+#[test]
+fn protected_page_len_equals_page_size() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+    assert_eq!(id.get(&p).unwrap().len(), 1024);
+}
+
+#[test]
+fn protected_read_initial_content_is_zero() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn protected_write_not_visible_before_commit() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+    {
+        let mut w = id.get_mut(&mut p).unwrap();
+        w.page_mut().as_bytes_mut().fill(0xFF);
+        // drop without commit
+    }
+    // Active physical page was never touched; must still read as zeros.
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn protected_write_visible_after_commit() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+    let mut w = id.get_mut(&mut p).unwrap();
+    w.page_mut().as_bytes_mut().fill(0xAB);
+    w.commit().unwrap();
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0xAB));
+}
+
+#[test]
+fn protected_second_write_overwrites_first() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+
+    let mut w = id.get_mut(&mut p).unwrap();
+    w.page_mut().as_bytes_mut().fill(0xAB);
+    w.commit().unwrap();
+
+    let mut w2 = id.get_mut(&mut p).unwrap();
+    w2.page_mut().as_bytes_mut().fill(0xCD);
+    w2.commit().unwrap();
+
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0xCD));
+}
+
+#[test]
+fn protected_alternating_writes_toggle_active_slot() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+
+    // initial: active_slot = 0
+    assert_eq!(p.protected_active_slot(id), 0);
+
+    let mut w = id.get_mut(&mut p).unwrap();
+    w.page_mut().as_bytes_mut().fill(1);
+    w.commit().unwrap();
+    assert_eq!(p.protected_active_slot(id), 1); // flipped
+
+    let mut w2 = id.get_mut(&mut p).unwrap();
+    w2.page_mut().as_bytes_mut().fill(2);
+    w2.commit().unwrap();
+    assert_eq!(p.protected_active_slot(id), 0); // flipped back
+
+    let mut w3 = id.get_mut(&mut p).unwrap();
+    w3.page_mut().as_bytes_mut().fill(3);
+    w3.commit().unwrap();
+    assert_eq!(p.protected_active_slot(id), 1);
+}
+
+#[test]
+fn protected_free_releases_backing_pages() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    p.alloc_protected().unwrap(); // first alloc: creates dir block + backing pages
+    let id = p.alloc_protected().unwrap(); // second alloc: reuses dir block, new backing pages
+    // Measure free count AFTER the second alloc (and any grow it triggered).
+    let free_before = p.free_page_count();
+    p.free_protected(id).unwrap(); // releases exactly 2 backing pages
+    assert_eq!(p.free_page_count(), free_before + 2);
+}
+
+#[test]
+fn protected_double_free_error() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+    p.free_protected(id).unwrap();
+    assert!(matches!(
+        p.free_protected(id),
+        Err(MappedPageError::DoubleFree)
+    ));
+}
+
+#[test]
+fn protected_get_invalid_id_returns_out_of_bounds() {
+    let tmp = TempPath::new();
+    let p = Pager::create(tmp.path(), 10).unwrap();
+    // No dir blocks exist yet; any slot index is out of bounds.
+    assert!(matches!(
+        ProtectedPageId(0).get(&p),
+        Err(MappedPageError::OutOfBounds)
+    ));
+    assert!(matches!(
+        ProtectedPageId(u64::MAX).get(&p),
+        Err(MappedPageError::OutOfBounds)
+    ));
+}
+
+#[test]
+fn protected_get_freed_slot_returns_out_of_bounds() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id = p.alloc_protected().unwrap();
+    p.free_protected(id).unwrap();
+    assert!(matches!(id.get(&p), Err(MappedPageError::OutOfBounds)));
+}
+
+#[test]
+fn protected_slot_reuse_after_free() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let id0 = p.alloc_protected().unwrap();
+
+    // Write something, commit, then free.
+    let mut w = id0.get_mut(&mut p).unwrap();
+    w.page_mut().as_bytes_mut().fill(0xAB);
+    w.commit().unwrap();
+    p.free_protected(id0).unwrap();
+
+    // Realloc must reuse slot 0.
+    let id1 = p.alloc_protected().unwrap();
+    assert_eq!(id1.0, 0);
+    // New backing pages are freshly allocated → content is zero, not 0xAB.
+    assert!(id1.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn protected_alloc_survives_reopen() {
+    let tmp = TempPath::new();
+    let id = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        p.alloc_protected().unwrap()
+    };
+    let p = Pager::open(tmp.path()).unwrap();
+    // Slot must be accessible and marked in-use after reopen.
+    assert!(id.get(&p).is_ok());
+}
+
+#[test]
+fn protected_write_survives_reopen() {
+    let tmp = TempPath::new();
+    let id = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let id = p.alloc_protected().unwrap();
+        let mut w = id.get_mut(&mut p).unwrap();
+        w.page_mut().as_bytes_mut().fill(0x5C);
+        w.commit().unwrap();
+        id
+    };
+    let p = Pager::open(tmp.path()).unwrap();
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0x5C));
+}
+
+#[test]
+fn protected_multiple_writes_survive_reopen() {
+    const PAT1: u8 = 0xAA;
+    const PAT2: u8 = 0xBB;
+    let tmp = TempPath::new();
+    let (id0, id1) = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let id0 = p.alloc_protected().unwrap();
+        let id1 = p.alloc_protected().unwrap();
+
+        let mut w = id0.get_mut(&mut p).unwrap();
+        w.page_mut().as_bytes_mut().fill(PAT1);
+        w.commit().unwrap();
+
+        let mut w = id1.get_mut(&mut p).unwrap();
+        w.page_mut().as_bytes_mut().fill(PAT2);
+        w.commit().unwrap();
+        (id0, id1)
+    };
+    let p = Pager::open(tmp.path()).unwrap();
+    assert!(id0.get(&p).unwrap().as_bytes().iter().all(|&b| b == PAT1));
+    assert!(id1.get(&p).unwrap().as_bytes().iter().all(|&b| b == PAT2));
+}
+
+#[test]
+fn protected_free_survives_reopen() {
+    let tmp = TempPath::new();
+    let id = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let id = p.alloc_protected().unwrap();
+        p.free_protected(id).unwrap();
+        id
+    };
+    // Slot is free after reopen; getting it must fail.
+    let p = Pager::open(tmp.path()).unwrap();
+    assert!(matches!(id.get(&p), Err(MappedPageError::OutOfBounds)));
+}
+
+#[test]
+fn protected_normal_alloc_and_protected_alloc_coexist() {
+    let tmp = TempPath::new();
+    let mut p = Pager::create(tmp.path(), 10).unwrap();
+
+    let normal_id = p.alloc().unwrap();
+    let prot_id = p.alloc_protected().unwrap();
+    let normal_id2 = p.alloc().unwrap();
+
+    normal_id.get_mut(&mut p).unwrap().as_bytes_mut().fill(0x11);
+
+    let mut w = prot_id.get_mut(&mut p).unwrap();
+    w.page_mut().as_bytes_mut().fill(0x22);
+    w.commit().unwrap();
+
+    normal_id2
+        .get_mut(&mut p)
+        .unwrap()
+        .as_bytes_mut()
+        .fill(0x33);
+
+    assert!(
+        normal_id
+            .get(&p)
+            .unwrap()
+            .as_bytes()
+            .iter()
+            .all(|&b| b == 0x11)
+    );
+    assert!(
+        prot_id
+            .get(&p)
+            .unwrap()
+            .as_bytes()
+            .iter()
+            .all(|&b| b == 0x22)
+    );
+    assert!(
+        normal_id2
+            .get(&p)
+            .unwrap()
+            .as_bytes()
+            .iter()
+            .all(|&b| b == 0x33)
+    );
+}
+
+// ── Protected-page crash simulation tests ─────────────────────────────────────
+
+/// Helper: byte offset of the last 4 bytes (checksum) of a physical page.
+fn phys_page_checksum_offset(phys: u64, page_size: usize) -> u64 {
+    phys * page_size as u64 + page_size as u64 - 4
+}
+
+/// Helper: byte offset of the start of a physical page.
+fn phys_page_offset(phys: u64, page_size: usize) -> u64 {
+    phys * page_size as u64
+}
+
+#[test]
+fn crash_corrupt_active_dir_page_falls_back_to_inactive() {
+    let tmp = TempPath::new();
+
+    // Commit a write so the active dir page records active_slot=1.
+    let id = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let id = p.alloc_protected().unwrap();
+        let mut w = id.get_mut(&mut p).unwrap();
+        w.page_mut().as_bytes_mut().fill(0xAB);
+        w.commit().unwrap();
+        // Active dir page is now A (page_a of the dir block).
+        // Verify active_slot = 1 (page_b of the data is active).
+        assert_eq!(p.protected_active_slot(id), 1);
+        let (dir_pa, _dir_pb, _active) = p.dir_block_pages(0);
+        // Active dir page is stored at dir_pa after the flip.
+        zero_range(tmp.path(), phys_page_checksum_offset(dir_pa, 1024), 4);
+        id
+    };
+
+    // Reopen: active dir page is corrupt → fall back to inactive (old state, slot=0).
+    let p = Pager::open(tmp.path()).unwrap();
+    // Slot 0 of the fallback page has active_slot=0 (pre-write state).
+    assert_eq!(p.protected_active_slot(id), 0);
+    // The active physical page (page_a of data) was never written → zeros.
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn crash_corrupt_both_dir_pages_returns_error() {
+    let tmp = TempPath::new();
+    {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        p.alloc_protected().unwrap();
+        let (dir_pa, dir_pb, _) = p.dir_block_pages(0);
+        zero_range(tmp.path(), phys_page_checksum_offset(dir_pa, 1024), 4);
+        zero_range(tmp.path(), phys_page_checksum_offset(dir_pb, 1024), 4);
+    }
+    assert!(matches!(
+        Pager::open(tmp.path()),
+        Err(MappedPageError::CorruptProtectedDirectory)
+    ));
+}
+
+/// Simulate crash between writing the inactive dir page (step 1 of commit_dir_block)
+/// and updating page 0 (step 3). Page 0 still points to the old active dir page, so
+/// the committed write appears uncommitted after recovery.
+#[test]
+fn crash_between_dir_write_and_page0_update() {
+    let tmp = TempPath::new();
+
+    let id = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let id = p.alloc_protected().unwrap();
+        // After alloc_protected: block.active = B (dir_pb).
+        // Backing pages: data_pa is active (slot 0).
+        let (dir_pa, dir_pb, active) = p.dir_block_pages(0);
+        assert_eq!(active, MetaSelector::B); // active dir page is B=dir_pb
+        let (_data_pa, data_pb) = p.protected_backing_pages(id);
+
+        // Now simulate: writer fills data_pb (the inactive data page) with 0xAB
+        // and the dir commit writes the new dir page to inactive dir_pa (A)...
+        // but page 0 is NOT updated (crash before step 3).
+
+        // Write 0xAB to the inactive data page.
+        write_at(
+            tmp.path(),
+            phys_page_offset(data_pb, 1024),
+            &vec![0xABu8; 1024],
+        );
+
+        // Write a valid dir page to dir_pa (currently inactive/A) reflecting
+        // active_slot=1 (data_pb active) — as if commit_dir_block step 1 completed.
+        let mut new_dir = DirPage::new_empty(1024);
+        new_dir.entries[0] = DirEntry {
+            in_use: true,
+            page_a: p.protected_backing_pages(id).0,
+            page_b: data_pb,
+            active_slot: 1,
+            generation: 1,
+            checksum: crc32fast::hash(&vec![0xABu8; 1024]),
+        };
+        let mut dir_buf = vec![0u8; 1024];
+        new_dir.write_to(&mut dir_buf);
+        write_at(tmp.path(), phys_page_offset(dir_pa, 1024), &dir_buf);
+
+        // Do NOT update page 0 → superblock still says active dir = B = dir_pb.
+        let _ = (dir_pb, active); // keep compiler happy
+        id
+    };
+
+    // Reopen: page 0 says active dir = B (dir_pb), which has the pre-write state.
+    let p = Pager::open(tmp.path()).unwrap();
+    // active_slot = 0 → data_pa is active → zeros.
+    assert_eq!(p.protected_active_slot(id), 0);
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0));
+}
+
+#[test]
+fn crash_committed_write_survives_reopen() {
+    let tmp = TempPath::new();
+    let id = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let id = p.alloc_protected().unwrap();
+        let mut w = id.get_mut(&mut p).unwrap();
+        w.page_mut().as_bytes_mut().fill(0xDD);
+        w.commit().unwrap();
+        id
+    };
+    let p = Pager::open(tmp.path()).unwrap();
+    assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0xDD));
+}
+
+#[test]
+fn crash_committed_free_survives_reopen() {
+    let tmp = TempPath::new();
+    let id = {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let id = p.alloc_protected().unwrap();
+        p.free_protected(id).unwrap();
+        id
+    };
+    let p = Pager::open(tmp.path()).unwrap();
+    assert!(matches!(id.get(&p), Err(MappedPageError::OutOfBounds)));
+}
+
+#[test]
+fn crash_corrupt_page0_dir_section_returns_error() {
+    let tmp = TempPath::new();
+    {
+        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        p.alloc_protected().unwrap(); // writes dir block ref to page 0
+    }
+    // Corrupt the dir section checksum at the end of page 0.
+    zero_range(tmp.path(), 1024 - 4, 4);
+    assert!(matches!(
+        Pager::open(tmp.path()),
+        Err(MappedPageError::CorruptDirectoryIndex)
+    ));
+}
+
+#[test]
+fn crash_old_file_without_dir_section_opens_cleanly() {
+    // Simulate a file created before protected pages were added:
+    // page 0 bytes 20..1024 are all zeros (no dir section, no checksum).
+    let tmp = TempPath::new();
+    Pager::create(tmp.path(), 10).unwrap();
+    // Zero out everything after the 20-byte superblock in page 0.
+    zero_range(tmp.path(), 20, 1024 - 20);
+    // Should open successfully with no directory blocks.
+    let p = Pager::open(tmp.path()).unwrap();
+    assert_eq!(p.free_page_count(), 1);
 }

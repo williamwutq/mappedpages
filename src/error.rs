@@ -59,7 +59,10 @@ impl fmt::Display for MappedPageError {
                 write!(f, "directory block index in page 0 is corrupt")
             }
             MappedPageError::DirectoryFull => {
-                write!(f, "page 0 has no room for additional directory block references")
+                write!(
+                    f,
+                    "page 0 has no room for additional directory block references"
+                )
             }
         }
     }

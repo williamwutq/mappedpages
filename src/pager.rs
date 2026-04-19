@@ -164,8 +164,8 @@ impl Pager {
         };
 
         // Load directory block references from page 0's extended section.
-        let mut dir_blocks =
-            read_dir_blocks(&mmap[0..page_size]).map_err(|_| MappedPageError::CorruptDirectoryIndex)?;
+        let mut dir_blocks = read_dir_blocks(&mmap[0..page_size])
+            .map_err(|_| MappedPageError::CorruptDirectoryIndex)?;
 
         // Load the active directory page for each block, falling back to the alternate.
         let mut dir_pages = Vec::with_capacity(dir_blocks.len());
@@ -251,7 +251,11 @@ impl Pager {
 
         // Try to claim a free slot in an existing directory block.
         for block_idx in 0..self.dir_pages.len() {
-            if let Some(slot) = self.dir_pages[block_idx].entries.iter().position(|e| !e.in_use) {
+            if let Some(slot) = self.dir_pages[block_idx]
+                .entries
+                .iter()
+                .position(|e| !e.in_use)
+            {
                 // Allocate two backing pages and commit the normal metadata.
                 let pa = self.alloc_one_raw()?;
                 let pb = self.alloc_one_raw()?;
@@ -360,6 +364,32 @@ impl Pager {
         self.active_meta
     }
 
+    /// Returns (page_a, page_b, active_selector) for one directory block (test-only).
+    #[cfg(test)]
+    pub(crate) fn dir_block_pages(&self, block_idx: usize) -> (u64, u64, MetaSelector) {
+        let b = &self.dir_blocks[block_idx];
+        (b.page_a, b.page_b, b.active)
+    }
+
+    /// Which slot (0 = page_a, 1 = page_b) is the active copy of a protected page (test-only).
+    #[cfg(test)]
+    pub(crate) fn protected_active_slot(&self, id: ProtectedPageId) -> u8 {
+        let epp = dir_entries_per_page(self.page_size);
+        let block_idx = id.0 as usize / epp;
+        let slot = id.0 as usize % epp;
+        self.dir_pages[block_idx].entries[slot].active_slot
+    }
+
+    /// Physical page numbers (page_a, page_b) backing a protected page (test-only).
+    #[cfg(test)]
+    pub(crate) fn protected_backing_pages(&self, id: ProtectedPageId) -> (u64, u64) {
+        let epp = dir_entries_per_page(self.page_size);
+        let block_idx = id.0 as usize / epp;
+        let slot = id.0 as usize % epp;
+        let e = &self.dir_pages[block_idx].entries[slot];
+        (e.page_a, e.page_b)
+    }
+
     // ── Page access (called by PageId / ProtectedPageId) ──────────────────────
 
     pub(crate) fn get_page(&self, id: PageId) -> Result<&MappedPage, MappedPageError> {
@@ -396,7 +426,11 @@ impl Pager {
         let block_idx = id.0 as usize / epp;
         let slot = id.0 as usize % epp;
         let entry = self.dir_entry(block_idx, slot)?;
-        let phys = if entry.active_slot == 0 { entry.page_a } else { entry.page_b };
+        let phys = if entry.active_slot == 0 {
+            entry.page_a
+        } else {
+            entry.page_b
+        };
         let ps = self.page_size;
         let off = phys as usize * ps;
         Ok(unsafe { MappedPage::from_slice(&self.mmap()?[off..off + ps]) })

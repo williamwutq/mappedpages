@@ -286,7 +286,11 @@ impl DirBlockRef {
         let page_a = u64::from_le_bytes(data[0..8].try_into().ok()?);
         let page_b = u64::from_le_bytes(data[8..16].try_into().ok()?);
         let active = MetaSelector::from_byte(data[16])?;
-        Some(DirBlockRef { page_a, page_b, active })
+        Some(DirBlockRef {
+            page_a,
+            page_b,
+            active,
+        })
     }
 
     pub(crate) fn write_to(&self, buf: &mut [u8]) {
@@ -307,7 +311,9 @@ pub(crate) fn read_dir_blocks(page0: &[u8]) -> Result<Vec<DirBlockRef>, ()> {
         return Ok(vec![]);
     }
     let count = u32::from_le_bytes(
-        page0[PAGE0_DIR_OFFSET..PAGE0_DIR_OFFSET + 4].try_into().map_err(|_| ())?,
+        page0[PAGE0_DIR_OFFSET..PAGE0_DIR_OFFSET + 4]
+            .try_into()
+            .map_err(|_| ())?,
     ) as usize;
     if count == 0 {
         return Ok(vec![]);
@@ -316,8 +322,7 @@ pub(crate) fn read_dir_blocks(page0: &[u8]) -> Result<Vec<DirBlockRef>, ()> {
     if page_size < PAGE0_DIR_OFFSET + 4 + 4 {
         return Err(());
     }
-    let stored_csum =
-        u32::from_le_bytes(page0[page_size - 4..].try_into().map_err(|_| ())?);
+    let stored_csum = u32::from_le_bytes(page0[page_size - 4..].try_into().map_err(|_| ())?);
     let computed_csum = crc32fast::hash(&page0[PAGE0_DIR_OFFSET..page_size - 4]);
     if stored_csum != computed_csum {
         return Err(());
@@ -379,7 +384,14 @@ impl DirEntry {
         let active_slot = data[17];
         let generation = u64::from_le_bytes(data[18..26].try_into().ok()?);
         let checksum = u32::from_le_bytes(data[26..30].try_into().ok()?);
-        Some(DirEntry { in_use, page_a, page_b, active_slot, generation, checksum })
+        Some(DirEntry {
+            in_use,
+            page_a,
+            page_b,
+            active_slot,
+            generation,
+            checksum,
+        })
     }
 
     pub(crate) fn write_to(&self, buf: &mut [u8]) {
@@ -403,7 +415,9 @@ impl DirPage {
     /// Create a fresh, all-free directory page for the given page size.
     pub(crate) fn new_empty(page_size: usize) -> Self {
         let capacity = dir_entries_per_page(page_size) as u32;
-        let entries = (0..capacity as usize).map(|_| DirEntry::default()).collect();
+        let entries = (0..capacity as usize)
+            .map(|_| DirEntry::default())
+            .collect();
         DirPage { capacity, entries }
     }
 
@@ -428,7 +442,10 @@ impl DirPage {
             let off = 8 + i * DIR_ENTRY_SIZE;
             entries.push(DirEntry::from_bytes(&data[off..off + DIR_ENTRY_SIZE])?);
         }
-        Some(DirPage { capacity: capacity as u32, entries })
+        Some(DirPage {
+            capacity: capacity as u32,
+            entries,
+        })
     }
 
     /// Serialize into a raw page slice.

@@ -54,7 +54,10 @@ impl<'a> ProtectedPageWriter<'a> {
         let off = self.inactive_phys_page as usize * ps;
         // SAFETY: mmap was verified available when the writer was created.
         // We hold &mut Pager, so no concurrent grow or mmap replacement can occur.
-        let slice = &mut self.pager.mmap.as_mut()
+        let slice = &mut self
+            .pager
+            .mmap
+            .as_mut()
             .expect("mmap available: verified at ProtectedPageWriter construction")[off..off + ps];
         unsafe { MappedPage::from_slice_mut(slice) }
     }
@@ -64,6 +67,7 @@ impl<'a> ProtectedPageWriter<'a> {
     /// After this returns `Ok(())`, the written data is the new active copy and
     /// will survive a crash.
     pub fn commit(self) -> Result<(), MappedPageError> {
-        self.pager.commit_protected_write(self.id, self.inactive_phys_page, self.inactive_slot)
+        self.pager
+            .commit_protected_write(self.id, self.inactive_phys_page, self.inactive_slot)
     }
 }
