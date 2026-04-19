@@ -6,6 +6,7 @@ authors = ["William Wu <williamwutq@gmail.com>", "Claude <claude@anthropic.com>"
 license = "MIT"
 description = "A fixed-size page provider backed by memory mapping, intended for building higher-level allocators and storage systems"
 readme = "README.md"
+changelog = "CHANGELOG.md"
 repository = "https://github.com/williamwutq/mappedpages"
 documentation = "https://docs.rs/mappedpages"
 keywords = ["memory-mapping", "allocator", "storage", "pages", "fixed-size"]
