@@ -54,9 +54,11 @@ mod error;
 mod meta;
 mod page;
 mod pager;
+mod protected;
 #[cfg(test)]
 mod tests;
 
 pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
 pub use pager::Pager;
+pub use protected::{ProtectedPageId, ProtectedPageWriter};

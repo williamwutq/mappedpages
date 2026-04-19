@@ -46,6 +46,25 @@ pub(crate) const FIRST_DATA_PAGE: u64 = 3;
 /// Minimum allowed `page_size_log2` (2^10 = 1024 bytes).
 pub(crate) const MIN_PAGE_SIZE_LOG2: u32 = 10;
 
+/// Byte offset in page 0 where the directory block array begins (after the 20-byte superblock).
+pub(crate) const PAGE0_DIR_OFFSET: usize = 20;
+/// Bytes per directory block reference stored in page 0: page_a(8) + page_b(8) + active(1).
+pub(crate) const DIR_BLOCK_REF_SIZE: usize = 17;
+/// Bytes per protected-page entry in a directory page: in_use(1)+page_a(8)+page_b(8)+slot(1)+gen(8)+csum(4).
+pub(crate) const DIR_ENTRY_SIZE: usize = 30;
+
+/// Maximum number of directory block pairs whose references fit in page 0.
+/// Layout: [20..24] = count(4), [24..ps-4] = entries, [ps-4..ps] = checksum(4).
+pub(crate) fn max_dir_blocks(page_size: usize) -> usize {
+    page_size.saturating_sub(PAGE0_DIR_OFFSET + 4 + 4) / DIR_BLOCK_REF_SIZE
+}
+
+/// Maximum number of protected-page entries that fit in one directory page.
+/// Layout: [0..8] = header(8), [8..ps-4] = entries, [ps-4..ps] = checksum(4).
+pub(crate) fn dir_entries_per_page(page_size: usize) -> usize {
+    page_size.saturating_sub(8 + 4) / DIR_ENTRY_SIZE
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetaSelector {
     A,
@@ -246,5 +265,184 @@ impl MetaPage {
         let added = new_total_pages.saturating_sub(self.total_pages);
         self.free_count += added;
         self.total_pages = new_total_pages;
+    }
+}
+
+// ── Directory block references (stored in page 0) ─────────────────────────────
+
+/// Reference to one A/B pair of directory pages, stored in page 0's extended section.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirBlockRef {
+    pub page_a: u64,
+    pub page_b: u64,
+    pub active: MetaSelector,
+}
+
+impl DirBlockRef {
+    pub(crate) fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < DIR_BLOCK_REF_SIZE {
+            return None;
+        }
+        let page_a = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        let page_b = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        let active = MetaSelector::from_byte(data[16])?;
+        Some(DirBlockRef { page_a, page_b, active })
+    }
+
+    pub(crate) fn write_to(&self, buf: &mut [u8]) {
+        buf[0..8].copy_from_slice(&self.page_a.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.page_b.to_le_bytes());
+        buf[16] = self.active.to_byte();
+    }
+}
+
+/// Parse directory block references from page 0's extended section.
+///
+/// Returns `Ok(vec![])` when there are no directory blocks (backward-compatible
+/// with files created before protected pages were added).  Returns `Err(())`
+/// only if the count is non-zero but the checksum fails or a ref is malformed.
+pub(crate) fn read_dir_blocks(page0: &[u8]) -> Result<Vec<DirBlockRef>, ()> {
+    let page_size = page0.len();
+    if page_size < PAGE0_DIR_OFFSET + 8 {
+        return Ok(vec![]);
+    }
+    let count = u32::from_le_bytes(
+        page0[PAGE0_DIR_OFFSET..PAGE0_DIR_OFFSET + 4].try_into().map_err(|_| ())?,
+    ) as usize;
+    if count == 0 {
+        return Ok(vec![]);
+    }
+    // Validate the dir section checksum: covers [PAGE0_DIR_OFFSET..page_size-4].
+    if page_size < PAGE0_DIR_OFFSET + 4 + 4 {
+        return Err(());
+    }
+    let stored_csum =
+        u32::from_le_bytes(page0[page_size - 4..].try_into().map_err(|_| ())?);
+    let computed_csum = crc32fast::hash(&page0[PAGE0_DIR_OFFSET..page_size - 4]);
+    if stored_csum != computed_csum {
+        return Err(());
+    }
+    if count > max_dir_blocks(page_size) {
+        return Err(());
+    }
+    let entries_start = PAGE0_DIR_OFFSET + 4;
+    let mut blocks = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = entries_start + i * DIR_BLOCK_REF_SIZE;
+        let block = DirBlockRef::from_bytes(&page0[off..off + DIR_BLOCK_REF_SIZE]).ok_or(())?;
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+/// Serialize directory block references into page 0's extended section.
+///
+/// Writes `[PAGE0_DIR_OFFSET..page_size]`: count(4) + entries + padding + checksum(4).
+pub(crate) fn write_dir_blocks(dir_blocks: &[DirBlockRef], page0: &mut [u8]) {
+    let page_size = page0.len();
+    let count = dir_blocks.len() as u32;
+    page0[PAGE0_DIR_OFFSET..PAGE0_DIR_OFFSET + 4].copy_from_slice(&count.to_le_bytes());
+    let entries_start = PAGE0_DIR_OFFSET + 4;
+    for (i, block) in dir_blocks.iter().enumerate() {
+        let off = entries_start + i * DIR_BLOCK_REF_SIZE;
+        block.write_to(&mut page0[off..off + DIR_BLOCK_REF_SIZE]);
+    }
+    let entries_end = entries_start + dir_blocks.len() * DIR_BLOCK_REF_SIZE;
+    page0[entries_end..page_size - 4].fill(0);
+    let csum = crc32fast::hash(&page0[PAGE0_DIR_OFFSET..page_size - 4]);
+    page0[page_size - 4..].copy_from_slice(&csum.to_le_bytes());
+}
+
+// ── Directory page entries ────────────────────────────────────────────────────
+
+/// One entry in a protected-page directory page.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DirEntry {
+    pub in_use: bool,
+    pub page_a: u64,
+    pub page_b: u64,
+    /// Which physical page (0 = page_a, 1 = page_b) is the currently active/readable copy.
+    pub active_slot: u8,
+    pub generation: u64,
+    /// CRC32 of the active physical page's content at the time of the last commit.
+    pub checksum: u32,
+}
+
+impl DirEntry {
+    pub(crate) fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < DIR_ENTRY_SIZE {
+            return None;
+        }
+        let in_use = data[0] != 0;
+        let page_a = u64::from_le_bytes(data[1..9].try_into().ok()?);
+        let page_b = u64::from_le_bytes(data[9..17].try_into().ok()?);
+        let active_slot = data[17];
+        let generation = u64::from_le_bytes(data[18..26].try_into().ok()?);
+        let checksum = u32::from_le_bytes(data[26..30].try_into().ok()?);
+        Some(DirEntry { in_use, page_a, page_b, active_slot, generation, checksum })
+    }
+
+    pub(crate) fn write_to(&self, buf: &mut [u8]) {
+        buf[0] = self.in_use as u8;
+        buf[1..9].copy_from_slice(&self.page_a.to_le_bytes());
+        buf[9..17].copy_from_slice(&self.page_b.to_le_bytes());
+        buf[17] = self.active_slot;
+        buf[18..26].copy_from_slice(&self.generation.to_le_bytes());
+        buf[26..30].copy_from_slice(&self.checksum.to_le_bytes());
+    }
+}
+
+/// In-memory view of one directory page (A or B copy).
+pub(crate) struct DirPage {
+    /// Fixed slot count: determined by page size at creation, stored in the page header.
+    pub capacity: u32,
+    pub entries: Vec<DirEntry>,
+}
+
+impl DirPage {
+    /// Create a fresh, all-free directory page for the given page size.
+    pub(crate) fn new_empty(page_size: usize) -> Self {
+        let capacity = dir_entries_per_page(page_size) as u32;
+        let entries = (0..capacity as usize).map(|_| DirEntry::default()).collect();
+        DirPage { capacity, entries }
+    }
+
+    /// Deserialize and checksum-validate from a raw page slice.
+    pub(crate) fn from_bytes(data: &[u8]) -> Option<Self> {
+        let page_size = data.len();
+        if page_size < 12 {
+            return None;
+        }
+        let stored_csum = u32::from_le_bytes(data[page_size - 4..].try_into().ok()?);
+        let computed_csum = crc32fast::hash(&data[..page_size - 4]);
+        if stored_csum != computed_csum {
+            return None;
+        }
+        let capacity = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+        let entries_end = 8 + capacity * DIR_ENTRY_SIZE;
+        if entries_end > page_size - 4 {
+            return None;
+        }
+        let mut entries = Vec::with_capacity(capacity);
+        for i in 0..capacity {
+            let off = 8 + i * DIR_ENTRY_SIZE;
+            entries.push(DirEntry::from_bytes(&data[off..off + DIR_ENTRY_SIZE])?);
+        }
+        Some(DirPage { capacity: capacity as u32, entries })
+    }
+
+    /// Serialize into a raw page slice.
+    pub(crate) fn write_to(&self, buf: &mut [u8]) {
+        let page_size = buf.len();
+        buf[0..4].copy_from_slice(&self.capacity.to_le_bytes());
+        buf[4..8].fill(0);
+        for (i, entry) in self.entries.iter().enumerate() {
+            let off = 8 + i * DIR_ENTRY_SIZE;
+            entry.write_to(&mut buf[off..off + DIR_ENTRY_SIZE]);
+        }
+        let entries_end = 8 + self.entries.len() * DIR_ENTRY_SIZE;
+        buf[entries_end..page_size - 4].fill(0);
+        let csum = crc32fast::hash(&buf[..page_size - 4]);
+        buf[page_size - 4..].copy_from_slice(&csum.to_le_bytes());
     }
 }

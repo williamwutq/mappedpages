@@ -22,6 +22,13 @@ pub enum MappedPageError {
     /// The pager's memory mapping is no longer available (failed remap after a
     /// grow error).  The pager cannot be used further; reopen the file.
     Unavailable,
+    /// Both A and B copies of a protected-page directory block failed their
+    /// checksums; the directory cannot be recovered automatically.
+    CorruptProtectedDirectory,
+    /// The directory block array in page 0 is corrupt (bad checksum or overflows).
+    CorruptDirectoryIndex,
+    /// No room remains in page 0 for additional directory block pair references.
+    DirectoryFull,
 }
 
 impl fmt::Display for MappedPageError {
@@ -44,6 +51,15 @@ impl fmt::Display for MappedPageError {
             MappedPageError::DoubleFree => write!(f, "page is already free"),
             MappedPageError::Unavailable => {
                 write!(f, "pager memory mapping unavailable; reopen the file")
+            }
+            MappedPageError::CorruptProtectedDirectory => {
+                write!(f, "both directory page copies are corrupt; cannot recover")
+            }
+            MappedPageError::CorruptDirectoryIndex => {
+                write!(f, "directory block index in page 0 is corrupt")
+            }
+            MappedPageError::DirectoryFull => {
+                write!(f, "page 0 has no room for additional directory block references")
             }
         }
     }
