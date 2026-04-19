@@ -50,6 +50,7 @@
 //! ensures each metadata page has enough room for the header, a bitmap
 //! large enough to be useful, and the trailing checksum.
 
+mod allocator;
 mod error;
 mod meta;
 mod page;
@@ -58,6 +59,7 @@ mod protected;
 #[cfg(test)]
 mod tests;
 
+pub use allocator::{PageAllocator, PageHandle};
 pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
 pub use pager::Pager;
