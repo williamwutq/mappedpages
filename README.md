@@ -4,6 +4,10 @@ A crash-consistent, memory-mapped, file-backed fixed-size page provider for Rust
 
 `mappedpages` manages a binary file divided into fixed-size pages, addressable by `PageId`.  It is intended as a low-level building block for higher-level allocators and storage systems.
 
+[![Crates.io](https://img.shields.io/crates/v/mappedpages)](https://crates.io/crates/mappedpages)
+[![Docs.rs](https://img.shields.io/docsrs/mappedpages)](https://docs.rs/mappedpages)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 ## Features
 
 - **Crash consistency** — every allocation state change is committed via a double-buffered write: the inactive metadata page is written and synced first, then the superblock pointer is flipped and synced. The active metadata page is never overwritten in place.
