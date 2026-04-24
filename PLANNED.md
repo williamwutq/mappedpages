@@ -1,0 +1,109 @@
+# Planned Features for mappedpages
+
+This document outlines planned enhancements to the `mappedpages` crate, a crash-consistent, memory-mapped, file-backed fixed-size page allocator.
+
+## 1. Async I/O Support
+
+Add async versions of key operations to support asynchronous I/O patterns. This would include:
+
+- `async fn alloc_async(&mut self) -> Result<PageId<PAGE_SIZE>, MappedPageError>`
+- `async fn free_async(&mut self, id: PageId<PAGE_SIZE>) -> Result<(), MappedPageError>`
+- Async page access methods that work with async runtimes like tokio
+
+This would be particularly valuable for high-performance applications where blocking I/O operations need to be avoided.
+
+## 2. Page Compression
+
+Implement optional page-level compression to reduce storage footprint:
+
+- Support for multiple compression algorithms (LZ4, Zstd, Snappy)
+- Configurable compression level
+- Automatic compression/decompression on page access
+- Compression metadata stored in page headers
+
+This would be especially useful for workloads with compressible data patterns, reducing both storage costs and I/O bandwidth.
+
+## 3. Bulk Operations API
+
+Add methods for efficient bulk allocation and deallocation:
+
+```rust
+fn alloc_bulk(&mut self, count: usize) -> Result<Vec<PageId<PAGE_SIZE>>, MappedPageError>
+fn free_bulk(&mut self, ids: Vec<PageId<PAGE_SIZE>>) -> Result<(), MappedPageError>
+```
+
+This would reduce the overhead of individual allocation calls and provide better performance for applications that need to allocate many pages at once.
+
+## 4. Read-Only Pager Mode
+
+Add a `ReadOnlyPager` variant that can open files without write access:
+
+- `ReadOnlyPager::<PAGE_SIZE>::open(path) -> Result<Self, MappedPageError>`
+- All write operations would be compile-time errors
+- Useful for read-heavy workloads, backup scenarios, and data analysis
+
+This would allow safe concurrent read access from multiple processes.
+
+## 5. Page Iterator
+
+Implement iterators to traverse allocated pages:
+
+```rust
+fn iter_allocated_pages(&self) -> impl Iterator<Item = PageId<PAGE_SIZE>>
+fn iter_allocated_pages_mut(&mut self) -> impl Iterator<Item = &mut PageId<PAGE_SIZE>>
+```
+
+This would enable efficient traversal of all allocated pages for maintenance, backup, or analysis operations.
+
+## 7. Page Defragmentation
+
+Add compaction functionality to reorganize pages and reclaim space:
+
+- `fn defragment(&mut self) -> Result<(), MappedPageError>`
+- Move allocated pages to eliminate gaps
+- Update page references automatically
+- Especially useful when combined with sub-page allocation
+
+This would help maintain optimal file layout over time as pages are allocated and freed.
+
+## 8. Backup and Snapshot Support
+    
+Implement utilities for creating point-in-time snapshots:
+
+- `fn create_snapshot(&self, path: impl AsRef<Path>) -> Result<(), MappedPageError>`
+- Copy-on-write snapshot mechanism
+- Incremental backup capabilities
+- Snapshot metadata tracking
+
+This would enable robust backup strategies and point-in-time recovery.
+
+## 9. Custom Allocation Strategies
+
+Make the allocation algorithm pluggable:
+
+```rust
+trait AllocationStrategy {
+    fn alloc(&mut self, bitmap: &mut [u64], total_pages: u64) -> Option<u64>;
+    fn free(&mut self, bitmap: &mut [u64], page_id: u64);
+}
+```
+
+Allow users to implement different strategies like:
+- First-fit allocation
+- Best-fit allocation
+- Segregated free lists
+- Buddy allocation
+
+This would allow optimization for specific workload patterns.
+
+## 12. Concurrent Access Patterns
+
+Add support for concurrent access while maintaining safety:
+
+- Reader-writer locks for different pages
+- `Arc<Pager>` with interior mutability for read operations
+- Thread-safe page access for read-only operations
+- Optional concurrent collections for page metadata
+
+This would enable multi-threaded applications to safely access different pages simultaneously.
+
