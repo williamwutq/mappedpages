@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read-only pager** — `ReadOnlyPager<PAGE_SIZE>` opens an existing
+  `mappedpages` file using an immutable `Mmap` (read-only OS mapping).  Because
+  no write methods exist on the type, attempts to allocate, free, or mutate pages
+  are compile-time errors rather than runtime panics.  Multiple threads — and
+  multiple processes — may open the same file as `ReadOnlyPager` concurrently
+  without any coordination.  Provides `get_page`, `get_protected_page`,
+  `iter_allocated_pages`, `iter_allocated_protected_pages`, `page_size`,
+  `page_count`, and `free_page_count`.  The iterator types
+  `ReadOnlyAllocatedPageIter` and `ReadOnlyAllocatedProtectedPageIter` are
+  exported from the crate root.  The existing `Pager` API and file format are
+  unchanged.
 - **Concurrent access** — `ConcurrentPager<PAGE_SIZE>` wraps a `Pager` in an
   `Arc<RwLock<…>>` and is `Clone`, `Send`, and `Sync`.  `read()` acquires a
   shared `PagerReadGuard` (multiple threads may hold one simultaneously);

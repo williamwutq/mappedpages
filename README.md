@@ -17,6 +17,7 @@ A crash-consistent, memory-mapped, file-backed fixed-size page provider for Rust
 - **Dynamic growth** — the file grows automatically when space is exhausted, with safe recovery if a remap fails mid-grow.
 - **CRC32 checksums** — every metadata page and directory block is protected by a CRC32 checksum.  On open, the library validates both copies and falls back to the alternate if one is corrupt.
 - **Sub-page allocation** — `SubPageAllocator` divides big pages into smaller uniform sub-pages, so callers don't have to implement their own bitmap-based slab allocators on top of the raw pages.  Implements `BulkPageAllocator` for sub-pages, so `alloc_bulk` and `free_bulk` work there too.
+- **Read-only pager** — `ReadOnlyPager<PAGE_SIZE>` opens an existing file with a read-only `Mmap`.  All write operations (alloc, free, page mutation) are absent from this type, so attempting them is a compile-time error.  Multiple processes may open the same file as `ReadOnlyPager` simultaneously without coordination.
 - **Concurrent access** — `ConcurrentPager<PAGE_SIZE>` wraps a `Pager` in an `Arc<RwLock<…>>` and is `Clone`, `Send`, and `Sync`. Multiple threads can hold a shared `PagerReadGuard` simultaneously for concurrent page reads; a `PagerWriteGuard` provides exclusive mutable access for allocation and mutation. Both guards dereference to the inner `Pager`, so the full existing API is available through them without any adapter methods.
 - **Async I/O support** — async versions of allocation and deallocation methods are available with the "async" feature flag, enabling integration with async runtimes like Tokio.
 - **Bulk operations** — `alloc_bulk(count)` and `free_bulk(ids)` allocate or free multiple regular pages in a single crash-safe metadata commit. `alloc_protected_bulk` and `free_protected_bulk` provide the same convenience for protected pages. `SubPageAllocator` also supports `alloc_bulk`/`free_bulk`. All `free_bulk` variants validate all ids atomically so no partial state change occurs on error. The `BulkPageAllocator` trait lets generic code require this capability with a single where-bound.
@@ -172,6 +173,35 @@ Recover the inner pager when you are done:
 
 ```rust
 let pager: Pager<4096> = sub.into_pager();
+```
+
+### Read-only access
+
+`ReadOnlyPager<PAGE_SIZE>` opens an existing file with a read-only `Mmap`.  Because the type has no `alloc`, `free`, or `get_page_mut` methods, write operations are compile-time errors rather than runtime panics.  Multiple processes may open the same file simultaneously.
+
+```rust
+use mappedpages::ReadOnlyPager;
+
+// Open an existing file in read-only mode.
+let ro = ReadOnlyPager::<4096>::open("data.bin")?;
+
+println!("pages: {}, free: {}", ro.page_count(), ro.free_page_count());
+
+// Read a page by id.
+let page = ro.get_page(id)?;
+println!("first byte: {}", page.as_bytes()[0]);
+
+// Iterate all allocated regular pages.
+for id in ro.iter_allocated_pages() {
+    let page = ro.get_page(id)?;
+    println!("page {}: {:?}", id.0, &page.as_bytes()[..4]);
+}
+
+// Iterate all allocated protected pages.
+for pid in ro.iter_allocated_protected_pages() {
+    let page = ro.get_protected_page(pid)?;
+    println!("protected page {}: {:?}", pid.0, &page.as_bytes()[..4]);
+}
 ```
 
 ### Concurrent access
@@ -349,6 +379,21 @@ The central type.  All page handles hold a borrow on the `Pager` that produced t
 | `page_count` | `(&self) -> u64` | Total pages in the file, including reserved pages 0–2 |
 | `free_page_count` | `(&self) -> u64` | Pages currently available for allocation |
 
+### `ReadOnlyPager<PAGE_SIZE>`
+
+A read-only view of a `mappedpages` file, backed by an immutable `Mmap`.  `Send + Sync`; multiple threads or processes may open the same file simultaneously.  No write methods exist on this type — attempts to allocate, free, or mutate pages are compile-time errors.
+
+| Method | Signature | Description |
+|---|---|---|
+| `open` | `(path) -> Result<Self>` | Open an existing file in read-only mode; fails if the on-disk page size ≠ `PAGE_SIZE` |
+| `get_page` | `(&self, PageId<PAGE_SIZE>) -> Result<&MappedPage>` | Immutably borrow a regular data page |
+| `get_protected_page` | `(&self, ProtectedPageId<PAGE_SIZE>) -> Result<&MappedPage>` | Immutably borrow the active copy of a protected page |
+| `iter_allocated_pages` | `(&self) -> ReadOnlyAllocatedPageIter<'_, PAGE_SIZE>` | Iterator over allocated regular data pages |
+| `iter_allocated_protected_pages` | `(&self) -> ReadOnlyAllocatedProtectedPageIter<'_, PAGE_SIZE>` | Iterator over in-use protected pages |
+| `page_size` | `(&self) -> usize` | Page size in bytes |
+| `page_count` | `(&self) -> u64` | Total pages in the file, including reserved pages 0–2 |
+| `free_page_count` | `(&self) -> u64` | Pages available for allocation as of the last commit visible at open time |
+
 ### `AllocatedPageIter<'_, PAGE_SIZE>`
 
 An iterator over allocated regular data pages, yielded by `Pager::iter_allocated_pages`.  Implements `Iterator<Item = PageId<PAGE_SIZE>>`.  Reserved pages 0–2 and all internal protected-page resources (directory block pages and backing pages for in-use protected entries) are never yielded.  Holds an immutable borrow on the `Pager` for its lifetime.
@@ -356,6 +401,14 @@ An iterator over allocated regular data pages, yielded by `Pager::iter_allocated
 ### `AllocatedProtectedPageIter<'_, PAGE_SIZE>`
 
 An iterator over in-use protected pages, yielded by `Pager::iter_allocated_protected_pages`.  Implements `Iterator<Item = ProtectedPageId<PAGE_SIZE>>`.  Regular data pages and internal directory-block pages are never included.  Holds an immutable borrow on the `Pager` for its lifetime.
+
+### `ReadOnlyAllocatedPageIter<'_, PAGE_SIZE>`
+
+An iterator over allocated regular data pages, yielded by `ReadOnlyPager::iter_allocated_pages`.  Implements `Iterator<Item = PageId<PAGE_SIZE>>`.  Reserved pages 0–2 and internal protected-page resources are never yielded.  Holds an immutable borrow on the `ReadOnlyPager` for its lifetime.
+
+### `ReadOnlyAllocatedProtectedPageIter<'_, PAGE_SIZE>`
+
+An iterator over in-use protected pages, yielded by `ReadOnlyPager::iter_allocated_protected_pages`.  Implements `Iterator<Item = ProtectedPageId<PAGE_SIZE>>`.  Regular data pages and internal directory-block pages are never included.  Holds an immutable borrow on the `ReadOnlyPager` for its lifetime.
 
 ### `PageId<PAGE_SIZE>`
 

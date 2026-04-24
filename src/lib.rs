@@ -103,6 +103,26 @@
 //! by [`SubPageAllocator`] for `SubPageId`.  Generic code can require bulk
 //! capability with a `where A: BulkPageAllocator<H>` bound.
 //!
+//! # Read-only access
+//!
+//! [`ReadOnlyPager<PAGE_SIZE>`](ReadOnlyPager) opens an existing file with an
+//! immutable `Mmap` (read-only OS mapping).  Because no write methods exist on
+//! the type, attempts to allocate, free, or mutate pages are compile-time errors.
+//! Multiple threads — or multiple processes — may open the same file as
+//! `ReadOnlyPager` simultaneously without coordination.
+//!
+//! ```rust,no_run
+//! # use mappedpages::{ReadOnlyPager, PageId};
+//! let ro = ReadOnlyPager::<4096>::open("data.bin").unwrap();
+//!
+//! println!("pages: {}, free: {}", ro.page_count(), ro.free_page_count());
+//!
+//! for id in ro.iter_allocated_pages() {
+//!     let page = ro.get_page(id).unwrap();
+//!     println!("page {}: first byte = {}", id.0, page.as_bytes()[0]);
+//! }
+//! ```
+//!
 //! # Concurrent access
 //!
 //! [`ConcurrentPager<PAGE_SIZE>`](ConcurrentPager) wraps a [`Pager`] in an
