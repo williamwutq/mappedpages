@@ -7,14 +7,17 @@ use memmap2::MmapMut;
 
 use crate::error::MappedPageError;
 use crate::meta::{
-    DirBlockRef, DirEntry, DirPage, FIRST_DATA_PAGE, MAGIC, MIN_PAGE_SIZE_LOG2, MetaPage,
-    MetaSelector, Superblock, dir_entries_per_page, max_dir_blocks, read_dir_blocks,
-    write_dir_blocks,
+    DirBlockRef, DirEntry, DirPage, FIRST_DATA_PAGE, MAGIC, MetaPage, MetaSelector, Superblock,
+    dir_entries_per_page, max_dir_blocks, read_dir_blocks, write_dir_blocks,
 };
 use crate::page::{MappedPage, PageId};
 use crate::protected::{ProtectedPageId, ProtectedPageWriter};
 
 /// Manages a memory-mapped, fixed-size-page file.
+///
+/// The const generic `PAGE_SIZE` is the page size in bytes.  It must be a
+/// power of two and at least 1024.  Using a mismatched `PAGE_SIZE` when
+/// opening an existing file returns [`MappedPageError::InvalidPageSize`].
 ///
 /// # Crash consistency
 ///
@@ -37,11 +40,10 @@ use crate::protected::{ProtectedPageId, ProtectedPageWriter};
 /// `self.mmap` becomes `None`.  All subsequent operations on the pager return
 /// `MappedPageError::Unavailable`.  The file on disk is still consistent and
 /// can be reopened via `Pager::open`.
-pub struct Pager {
+pub struct Pager<const PAGE_SIZE: usize> {
     file: File,
     /// `None` only after a failed remap; all operations return `Unavailable`.
     pub(crate) mmap: Option<MmapMut>,
-    pub(crate) page_size: usize,
     active_meta: MetaSelector,
     /// In-memory working copy of the active metadata.
     meta: MetaPage,
@@ -52,19 +54,18 @@ pub struct Pager {
     dir_pages: Vec<DirPage>,
 }
 
-impl Pager {
+impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
     // ── Construction ──────────────────────────────────────────────────────────
 
-    /// Create a new pager backed by `path`.
+    /// Create a new pager backed by `path` with page size `PAGE_SIZE` bytes.
     ///
-    /// `page_size_log2` sets page size to `2^page_size_log2` bytes and must be
-    /// at least `MIN_PAGE_SIZE_LOG2` (10, i.e. 1024 bytes).
-    /// The file must not already exist.
-    pub fn create(path: impl AsRef<Path>, page_size_log2: u32) -> Result<Self, MappedPageError> {
-        if page_size_log2 < MIN_PAGE_SIZE_LOG2 {
-            return Err(MappedPageError::InvalidPageSize);
-        }
-        let page_size = 1usize << page_size_log2;
+    /// `PAGE_SIZE` must be a power of two and at least 1024; violating either
+    /// constraint is a **compile error**.  The file must not already exist.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, MappedPageError> {
+        const { assert!(PAGE_SIZE.is_power_of_two(), "PAGE_SIZE must be a power of two") };
+        const { assert!(PAGE_SIZE >= 1024, "PAGE_SIZE must be at least 1024") };
+
+        let page_size_log2 = PAGE_SIZE.trailing_zeros();
         let initial_pages = 4u64;
 
         let file = OpenOptions::new()
@@ -73,17 +74,17 @@ impl Pager {
             .create_new(true)
             .open(path)?;
 
-        file.set_len(initial_pages * page_size as u64)?;
+        file.set_len(initial_pages * PAGE_SIZE as u64)?;
 
         let mut mmap = unsafe { MmapMut::map_mut(&file) }?;
 
         let meta = MetaPage::new_for_capacity(initial_pages);
 
         // Serialize metadata; write to both page 1 (A) and page 2 (B).
-        let mut meta_buf = vec![0u8; page_size];
+        let mut meta_buf = vec![0u8; PAGE_SIZE];
         meta.write_to(&mut meta_buf);
-        mmap[page_size..2 * page_size].copy_from_slice(&meta_buf);
-        mmap[2 * page_size..3 * page_size].copy_from_slice(&meta_buf);
+        mmap[PAGE_SIZE..2 * PAGE_SIZE].copy_from_slice(&meta_buf);
+        mmap[2 * PAGE_SIZE..3 * PAGE_SIZE].copy_from_slice(&meta_buf);
 
         // Write full page 0: superblock + empty dir section.
         let meta_checksum = MetaPage::page_checksum(&meta_buf);
@@ -93,17 +94,16 @@ impl Pager {
             active_meta: MetaSelector::A,
             meta_checksum,
         };
-        let mut page0_buf = vec![0u8; page_size];
+        let mut page0_buf = vec![0u8; PAGE_SIZE];
         sb.write_to(&mut page0_buf[0..20]);
         write_dir_blocks(&[], &mut page0_buf);
-        mmap[0..page_size].copy_from_slice(&page0_buf);
+        mmap[0..PAGE_SIZE].copy_from_slice(&page0_buf);
 
         mmap.flush()?;
 
         Ok(Pager {
             file,
             mmap: Some(mmap),
-            page_size,
             active_meta: MetaSelector::A,
             meta,
             dir_blocks: vec![],
@@ -112,6 +112,9 @@ impl Pager {
     }
 
     /// Open an existing pager file, validating and recovering metadata.
+    ///
+    /// Returns [`MappedPageError::InvalidPageSize`] if the on-disk page size
+    /// does not match `PAGE_SIZE`.
     ///
     /// The superblock is read first; from it we learn the page size and which
     /// metadata page is active.  The active page is then validated against both
@@ -122,6 +125,9 @@ impl Pager {
     /// Protected-page directory blocks are loaded from page 0's extended section
     /// with the same A/B fallback logic.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MappedPageError> {
+        const { assert!(PAGE_SIZE.is_power_of_two(), "PAGE_SIZE must be a power of two") };
+        const { assert!(PAGE_SIZE >= 1024, "PAGE_SIZE must be at least 1024") };
+
         let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         let mmap = unsafe { MmapMut::map_mut(&file) }?;
@@ -134,12 +140,11 @@ impl Pager {
             .filter(|sb| sb.is_valid())
             .ok_or(MappedPageError::CorruptSuperblock)?;
 
-        let page_size = (1usize)
-            .checked_shl(sb.page_size_log2)
-            .filter(|&ps| ps >= (1 << MIN_PAGE_SIZE_LOG2))
-            .ok_or(MappedPageError::InvalidPageSize)?;
+        if (1usize).checked_shl(sb.page_size_log2) != Some(PAGE_SIZE) {
+            return Err(MappedPageError::InvalidPageSize);
+        }
 
-        if mmap.len() < 4 * page_size {
+        if mmap.len() < 4 * PAGE_SIZE {
             return Err(MappedPageError::CorruptSuperblock);
         }
 
@@ -148,8 +153,8 @@ impl Pager {
 
         // Try the superblock-designated active page: internal checksum + superblock checksum.
         let active_opt: Option<MetaPage> = {
-            let off = active.page_id() as usize * page_size;
-            let page = &mmap[off..off + page_size];
+            let off = active.page_id() as usize * PAGE_SIZE;
+            let page = &mmap[off..off + PAGE_SIZE];
             MetaPage::from_bytes(page).filter(|_| MetaPage::page_checksum(page) == sb.meta_checksum)
         };
 
@@ -157,14 +162,14 @@ impl Pager {
         let (meta, active_meta) = if let Some(m) = active_opt {
             (m, active)
         } else {
-            let off = alt.page_id() as usize * page_size;
-            let page = &mmap[off..off + page_size];
+            let off = alt.page_id() as usize * PAGE_SIZE;
+            let page = &mmap[off..off + PAGE_SIZE];
             let m = MetaPage::from_bytes(page).ok_or(MappedPageError::CorruptMetadata)?;
             (m, alt)
         };
 
         // Load directory block references from page 0's extended section.
-        let mut dir_blocks = read_dir_blocks(&mmap[0..page_size])
+        let mut dir_blocks = read_dir_blocks(&mmap[0..PAGE_SIZE])
             .map_err(|_| MappedPageError::CorruptDirectoryIndex)?;
 
         // Load the active directory page for each block, falling back to the alternate.
@@ -180,8 +185,8 @@ impl Pager {
             };
 
             let try_parse = |phys: u64| -> Option<DirPage> {
-                let off = phys as usize * page_size;
-                let end = off + page_size;
+                let off = phys as usize * PAGE_SIZE;
+                let end = off + PAGE_SIZE;
                 if end > mmap.len() {
                     return None;
                 }
@@ -202,7 +207,6 @@ impl Pager {
         Ok(Pager {
             file,
             mmap: Some(mmap),
-            page_size,
             active_meta,
             meta,
             dir_blocks,
@@ -215,7 +219,7 @@ impl Pager {
     /// Allocate a fresh page.  Grows the file if no free pages remain.
     ///
     /// Pages 0–2 are never returned.
-    pub fn alloc(&mut self) -> Result<PageId, MappedPageError> {
+    pub fn alloc(&mut self) -> Result<PageId<PAGE_SIZE>, MappedPageError> {
         let id = self.alloc_one_raw()?;
         self.commit()?;
         Ok(PageId(id))
@@ -224,7 +228,7 @@ impl Pager {
     /// Mark `id` as free so it can be returned by a future `alloc`.
     ///
     /// Returns an error if `id` is reserved (0–2), out of range, or already free.
-    pub fn free(&mut self, id: PageId) -> Result<(), MappedPageError> {
+    pub fn free(&mut self, id: PageId<PAGE_SIZE>) -> Result<(), MappedPageError> {
         if id.0 < FIRST_DATA_PAGE {
             return Err(MappedPageError::ReservedPage);
         }
@@ -246,8 +250,8 @@ impl Pager {
     /// block; their locations are recorded in page 0.  If all existing directory
     /// blocks are full, another pair is allocated.  Two additional physical pages
     /// are always allocated as the backing copies for the new protected page.
-    pub fn alloc_protected(&mut self) -> Result<ProtectedPageId, MappedPageError> {
-        let epp = dir_entries_per_page(self.page_size);
+    pub fn alloc_protected(&mut self) -> Result<ProtectedPageId<PAGE_SIZE>, MappedPageError> {
+        let epp = dir_entries_per_page(PAGE_SIZE);
 
         // Try to claim a free slot in an existing directory block.
         for block_idx in 0..self.dir_pages.len() {
@@ -277,7 +281,7 @@ impl Pager {
         }
 
         // No free slot: need a new directory block pair.
-        if self.dir_blocks.len() >= max_dir_blocks(self.page_size) {
+        if self.dir_blocks.len() >= max_dir_blocks(PAGE_SIZE) {
             return Err(MappedPageError::DirectoryFull);
         }
 
@@ -294,7 +298,7 @@ impl Pager {
             page_b: dir_pb,
             active: MetaSelector::A,
         });
-        let mut new_dir_page = DirPage::new_empty(self.page_size);
+        let mut new_dir_page = DirPage::new_empty(PAGE_SIZE);
         let checksum = self.page_checksum_at(data_pa);
         new_dir_page.entries[0] = DirEntry {
             in_use: true,
@@ -316,8 +320,11 @@ impl Pager {
     ///
     /// Returns `DoubleFree` if the slot is already free, `OutOfBounds` if the
     /// id is out of range.
-    pub fn free_protected(&mut self, id: ProtectedPageId) -> Result<(), MappedPageError> {
-        let epp = dir_entries_per_page(self.page_size);
+    pub fn free_protected(
+        &mut self,
+        id: ProtectedPageId<PAGE_SIZE>,
+    ) -> Result<(), MappedPageError> {
+        let epp = dir_entries_per_page(PAGE_SIZE);
         let block_idx = id.0 as usize / epp;
         let slot = id.0 as usize % epp;
 
@@ -345,7 +352,7 @@ impl Pager {
 
     /// The page size this pager was created with, in bytes.
     pub fn page_size(&self) -> usize {
-        self.page_size
+        PAGE_SIZE
     }
 
     /// Total number of pages in the file, including reserved pages 0–2.
@@ -373,8 +380,8 @@ impl Pager {
 
     /// Which slot (0 = page_a, 1 = page_b) is the active copy of a protected page (test-only).
     #[cfg(test)]
-    pub(crate) fn protected_active_slot(&self, id: ProtectedPageId) -> u8 {
-        let epp = dir_entries_per_page(self.page_size);
+    pub(crate) fn protected_active_slot(&self, id: ProtectedPageId<PAGE_SIZE>) -> u8 {
+        let epp = dir_entries_per_page(PAGE_SIZE);
         let block_idx = id.0 as usize / epp;
         let slot = id.0 as usize % epp;
         self.dir_pages[block_idx].entries[slot].active_slot
@@ -382,8 +389,8 @@ impl Pager {
 
     /// Physical page numbers (page_a, page_b) backing a protected page (test-only).
     #[cfg(test)]
-    pub(crate) fn protected_backing_pages(&self, id: ProtectedPageId) -> (u64, u64) {
-        let epp = dir_entries_per_page(self.page_size);
+    pub(crate) fn protected_backing_pages(&self, id: ProtectedPageId<PAGE_SIZE>) -> (u64, u64) {
+        let epp = dir_entries_per_page(PAGE_SIZE);
         let block_idx = id.0 as usize / epp;
         let slot = id.0 as usize % epp;
         let e = &self.dir_pages[block_idx].entries[slot];
@@ -392,37 +399,38 @@ impl Pager {
 
     // ── Page access (called by PageId / ProtectedPageId) ──────────────────────
 
-    pub(crate) fn get_page(&self, id: PageId) -> Result<&MappedPage, MappedPageError> {
+    pub(crate) fn get_page(&self, id: PageId<PAGE_SIZE>) -> Result<&MappedPage, MappedPageError> {
         if id.0 < FIRST_DATA_PAGE {
             return Err(MappedPageError::ReservedPage);
         }
         if id.0 >= self.meta.total_pages {
             return Err(MappedPageError::OutOfBounds);
         }
-        let off = id.0 as usize * self.page_size;
-        let ps = self.page_size;
-        let slice = &self.mmap()?[off..off + ps];
+        let off = id.0 as usize * PAGE_SIZE;
+        let slice = &self.mmap()?[off..off + PAGE_SIZE];
         Ok(unsafe { MappedPage::from_slice(slice) })
     }
 
-    pub(crate) fn get_page_mut(&mut self, id: PageId) -> Result<&mut MappedPage, MappedPageError> {
+    pub(crate) fn get_page_mut(
+        &mut self,
+        id: PageId<PAGE_SIZE>,
+    ) -> Result<&mut MappedPage, MappedPageError> {
         if id.0 < FIRST_DATA_PAGE {
             return Err(MappedPageError::ReservedPage);
         }
         if id.0 >= self.meta.total_pages {
             return Err(MappedPageError::OutOfBounds);
         }
-        let off = id.0 as usize * self.page_size;
-        let ps = self.page_size;
-        let slice = &mut self.mmap_mut()?[off..off + ps];
+        let off = id.0 as usize * PAGE_SIZE;
+        let slice = &mut self.mmap_mut()?[off..off + PAGE_SIZE];
         Ok(unsafe { MappedPage::from_slice_mut(slice) })
     }
 
     pub(crate) fn get_protected_page(
         &self,
-        id: ProtectedPageId,
+        id: ProtectedPageId<PAGE_SIZE>,
     ) -> Result<&MappedPage, MappedPageError> {
-        let epp = dir_entries_per_page(self.page_size);
+        let epp = dir_entries_per_page(PAGE_SIZE);
         let block_idx = id.0 as usize / epp;
         let slot = id.0 as usize % epp;
         let entry = self.dir_entry(block_idx, slot)?;
@@ -431,16 +439,15 @@ impl Pager {
         } else {
             entry.page_b
         };
-        let ps = self.page_size;
-        let off = phys as usize * ps;
-        Ok(unsafe { MappedPage::from_slice(&self.mmap()?[off..off + ps]) })
+        let off = phys as usize * PAGE_SIZE;
+        Ok(unsafe { MappedPage::from_slice(&self.mmap()?[off..off + PAGE_SIZE]) })
     }
 
     pub(crate) fn get_protected_page_mut(
         &mut self,
-        id: ProtectedPageId,
-    ) -> Result<ProtectedPageWriter<'_>, MappedPageError> {
-        let epp = dir_entries_per_page(self.page_size);
+        id: ProtectedPageId<PAGE_SIZE>,
+    ) -> Result<ProtectedPageWriter<'_, PAGE_SIZE>, MappedPageError> {
+        let epp = dir_entries_per_page(PAGE_SIZE);
         let block_idx = id.0 as usize / epp;
         let slot = id.0 as usize % epp;
         let (inactive_phys, inactive_slot) = {
@@ -461,23 +468,22 @@ impl Pager {
     /// Called by `ProtectedPageWriter::commit` to finalise a protected-page write.
     pub(crate) fn commit_protected_write(
         &mut self,
-        id: ProtectedPageId,
+        id: ProtectedPageId<PAGE_SIZE>,
         inactive_phys: u64,
         inactive_slot: u8,
     ) -> Result<(), MappedPageError> {
-        let ps = self.page_size;
-        let epp = dir_entries_per_page(ps);
+        let epp = dir_entries_per_page(PAGE_SIZE);
         let block_idx = id.0 as usize / epp;
         let slot = id.0 as usize % epp;
 
         // Step 1: flush the inactive physical page.
-        let inactive_off = inactive_phys as usize * ps;
-        self.mmap()?.flush_range(inactive_off, ps)?;
+        let inactive_off = inactive_phys as usize * PAGE_SIZE;
+        self.mmap()?.flush_range(inactive_off, PAGE_SIZE)?;
 
         // Step 2: compute checksum of the newly written page.
         let new_checksum = {
             let mmap = self.mmap()?;
-            crc32fast::hash(&mmap[inactive_off..inactive_off + ps])
+            crc32fast::hash(&mmap[inactive_off..inactive_off + PAGE_SIZE])
         };
 
         // Step 3: update the in-memory directory entry.
@@ -504,10 +510,9 @@ impl Pager {
 
     /// CRC32 of the physical page at `phys_page_id`.
     fn page_checksum_at(&self, phys_page_id: u64) -> u32 {
-        let ps = self.page_size;
-        let off = phys_page_id as usize * ps;
+        let off = phys_page_id as usize * PAGE_SIZE;
         match self.mmap.as_ref() {
-            Some(m) => crc32fast::hash(&m[off..off + ps]),
+            Some(m) => crc32fast::hash(&m[off..off + PAGE_SIZE]),
             None => 0,
         }
     }
@@ -548,31 +553,30 @@ impl Pager {
     /// 3. Flip `self.active_meta`.
     fn commit(&mut self) -> Result<(), MappedPageError> {
         let inactive = self.active_meta.other();
-        let inactive_off = inactive.page_id() as usize * self.page_size;
-        let ps = self.page_size;
+        let inactive_off = inactive.page_id() as usize * PAGE_SIZE;
 
         self.meta.generation += 1;
 
-        let mut meta_buf = vec![0u8; ps];
+        let mut meta_buf = vec![0u8; PAGE_SIZE];
         self.meta.write_to(&mut meta_buf);
         let meta_checksum = MetaPage::page_checksum(&meta_buf);
 
         // Step 1: write metadata to inactive page, then msync.
-        self.mmap_mut()?[inactive_off..inactive_off + ps].copy_from_slice(&meta_buf);
-        self.mmap()?.flush_range(inactive_off, ps)?;
+        self.mmap_mut()?[inactive_off..inactive_off + PAGE_SIZE].copy_from_slice(&meta_buf);
+        self.mmap()?.flush_range(inactive_off, PAGE_SIZE)?;
 
         // Step 2: write full page 0 (superblock + dir block array), then msync.
-        let mut page0_buf = vec![0u8; ps];
+        let mut page0_buf = vec![0u8; PAGE_SIZE];
         let sb = Superblock {
             magic: MAGIC,
-            page_size_log2: ps.trailing_zeros(),
+            page_size_log2: PAGE_SIZE.trailing_zeros(),
             active_meta: inactive,
             meta_checksum,
         };
         sb.write_to(&mut page0_buf[0..20]);
         write_dir_blocks(&self.dir_blocks, &mut page0_buf);
-        self.mmap_mut()?[0..ps].copy_from_slice(&page0_buf);
-        self.mmap()?.flush_range(0, ps)?;
+        self.mmap_mut()?[0..PAGE_SIZE].copy_from_slice(&page0_buf);
+        self.mmap()?.flush_range(0, PAGE_SIZE)?;
 
         // Step 3: commit is durable; update in-memory pointer.
         self.active_meta = inactive;
@@ -584,10 +588,8 @@ impl Pager {
     /// 2. Flip the active selector for this block.
     /// 3. Rewrite page 0 to record the new active selector and msync.
     fn commit_dir_block(&mut self, block_idx: usize) -> Result<(), MappedPageError> {
-        let ps = self.page_size;
-
         // Serialize current in-memory dir page to a temp buffer.
-        let mut dir_buf = vec![0u8; ps];
+        let mut dir_buf = vec![0u8; PAGE_SIZE];
         self.dir_pages[block_idx].write_to(&mut dir_buf);
 
         // Identify the inactive physical dir page.
@@ -597,11 +599,11 @@ impl Pager {
             MetaSelector::A => block.page_a,
             MetaSelector::B => block.page_b,
         };
-        let inactive_off = inactive_phys as usize * ps;
+        let inactive_off = inactive_phys as usize * PAGE_SIZE;
 
         // Step 1: write to inactive dir page and flush.
-        self.mmap_mut()?[inactive_off..inactive_off + ps].copy_from_slice(&dir_buf);
-        self.mmap()?.flush_range(inactive_off, ps)?;
+        self.mmap_mut()?[inactive_off..inactive_off + PAGE_SIZE].copy_from_slice(&dir_buf);
+        self.mmap()?.flush_range(inactive_off, PAGE_SIZE)?;
 
         // Step 2: flip the in-memory active selector.
         self.dir_blocks[block_idx].active = inactive_sel;
@@ -610,22 +612,22 @@ impl Pager {
         // then write the full page 0 with updated dir blocks and flush.
         let active_meta = self.active_meta;
         let meta_checksum = {
-            let meta_off = active_meta.page_id() as usize * ps;
+            let meta_off = active_meta.page_id() as usize * PAGE_SIZE;
             let mmap = self.mmap()?;
-            MetaPage::page_checksum(&mmap[meta_off..meta_off + ps])
+            MetaPage::page_checksum(&mmap[meta_off..meta_off + PAGE_SIZE])
         };
 
-        let mut page0_buf = vec![0u8; ps];
+        let mut page0_buf = vec![0u8; PAGE_SIZE];
         let sb = Superblock {
             magic: MAGIC,
-            page_size_log2: ps.trailing_zeros(),
+            page_size_log2: PAGE_SIZE.trailing_zeros(),
             active_meta,
             meta_checksum,
         };
         sb.write_to(&mut page0_buf[0..20]);
         write_dir_blocks(&self.dir_blocks, &mut page0_buf);
-        self.mmap_mut()?[0..ps].copy_from_slice(&page0_buf);
-        self.mmap()?.flush_range(0, ps)?;
+        self.mmap_mut()?[0..PAGE_SIZE].copy_from_slice(&page0_buf);
+        self.mmap()?.flush_range(0, PAGE_SIZE)?;
 
         Ok(())
     }
@@ -639,8 +641,8 @@ impl Pager {
     /// (`Unavailable`); the file is consistent and can be reopened.
     fn grow(&mut self) -> Result<(), MappedPageError> {
         let new_total = self.meta.total_pages * 2;
-        let old_file_size = self.meta.total_pages * self.page_size as u64;
-        let new_file_size = new_total * self.page_size as u64;
+        let old_file_size = self.meta.total_pages * PAGE_SIZE as u64;
+        let new_file_size = new_total * PAGE_SIZE as u64;
 
         // Drop the mmap before resizing; required on all platforms.
         drop(self.mmap.take());

@@ -8,12 +8,18 @@ use crate::pager::Pager;
 ///
 /// The `u64` is a 0-based logical slot index into the protected-page directory.
 /// It is stable across reopens as long as the page is not freed.
+///
+/// The const generic `PAGE_SIZE` ties this handle to a `Pager<PAGE_SIZE>` so
+/// that handles from differently-sized pagers cannot be mixed at compile time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProtectedPageId(pub u64);
+pub struct ProtectedPageId<const PAGE_SIZE: usize>(pub u64);
 
-impl ProtectedPageId {
+impl<const PAGE_SIZE: usize> ProtectedPageId<PAGE_SIZE> {
     /// Read the currently active copy of this protected page.
-    pub fn get<'a>(&self, pager: &'a Pager) -> Result<&'a MappedPage, MappedPageError> {
+    pub fn get<'a>(
+        &self,
+        pager: &'a Pager<PAGE_SIZE>,
+    ) -> Result<&'a MappedPage, MappedPageError> {
         pager.get_protected_page(*self)
     }
 
@@ -24,8 +30,8 @@ impl ProtectedPageId {
     /// is called.
     pub fn get_mut<'a>(
         &self,
-        pager: &'a mut Pager,
-    ) -> Result<ProtectedPageWriter<'a>, MappedPageError> {
+        pager: &'a mut Pager<PAGE_SIZE>,
+    ) -> Result<ProtectedPageWriter<'a, PAGE_SIZE>, MappedPageError> {
         pager.get_protected_page_mut(*self)
     }
 }
@@ -36,29 +42,29 @@ impl ProtectedPageId {
 /// to make the write durable and crash-consistent.  Dropping without committing
 /// discards the write (the inactive physical page may contain partial data, but
 /// the active page — visible to readers — is unchanged until commit).
-pub struct ProtectedPageWriter<'a> {
-    pub(crate) pager: &'a mut Pager,
-    pub(crate) id: ProtectedPageId,
+pub struct ProtectedPageWriter<'a, const PAGE_SIZE: usize> {
+    pub(crate) pager: &'a mut Pager<PAGE_SIZE>,
+    pub(crate) id: ProtectedPageId<PAGE_SIZE>,
     /// Physical page number of the slot we are writing into (the inactive copy).
     pub(crate) inactive_phys_page: u64,
     /// Slot index (0 or 1) of the inactive copy, which becomes active after commit.
     pub(crate) inactive_slot: u8,
 }
 
-impl<'a> ProtectedPageWriter<'a> {
+impl<'a, const PAGE_SIZE: usize> ProtectedPageWriter<'a, PAGE_SIZE> {
     /// Mutable view of the page being written.
     ///
     /// Changes are not visible to readers until [`commit`](Self::commit) is called.
     pub fn page_mut(&mut self) -> &mut MappedPage {
-        let ps = self.pager.page_size;
-        let off = self.inactive_phys_page as usize * ps;
+        let off = self.inactive_phys_page as usize * PAGE_SIZE;
         // SAFETY: mmap was verified available when the writer was created.
         // We hold &mut Pager, so no concurrent grow or mmap replacement can occur.
         let slice = &mut self
             .pager
             .mmap
             .as_mut()
-            .expect("mmap available: verified at ProtectedPageWriter construction")[off..off + ps];
+            .expect("mmap available: verified at ProtectedPageWriter construction")
+            [off..off + PAGE_SIZE];
         unsafe { MappedPage::from_slice_mut(slice) }
     }
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `Pager`, `PageId`, `ProtectedPageId`, and `ProtectedPageWriter` are now generic over a const `PAGE_SIZE: usize`. A `PageId<1024>` cannot be passed to a `Pager<4096>` — the compiler rejects the mismatch. This is a source-level breaking change: existing call sites must be updated (see migration note below).
+- `Pager::create` no longer takes a `page_size_log2: u32` argument. The page size is now the const generic: `Pager::<4096>::create("data.bin")`. The requirement that `PAGE_SIZE` be a power of two and at least 1024 is now enforced at compile time rather than returning a runtime `InvalidPageSize` error.
+- `Pager::open` validates the on-disk page size against `PAGE_SIZE` and returns `InvalidPageSize` at runtime if they differ.
+
+**Migration:** Replace `Pager::create(path, log2)` with `Pager::<{1 << log2}>::create(path)` and `Pager::open(path)` with `Pager::<PAGE_SIZE>::open(path)`. Type annotations on `PageId` and `ProtectedPageId` gain the same parameter (e.g. `PageId<4096>`), though in most cases the compiler infers it from context.
+
 ## [0.1.0] - 2026-04-18
 
 ### Added

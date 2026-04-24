@@ -298,7 +298,7 @@ fn superblock_too_short_returns_none() {
 #[test]
 fn pager_create_basic() {
     let tmp = TempPath::new();
-    let p = Pager::create(tmp.path(), 10).unwrap();
+    let p = Pager::<1024>::create(tmp.path()).unwrap();
     assert_eq!(p.page_size(), 1024);
     assert_eq!(p.page_count(), 4);
     assert_eq!(p.free_page_count(), 1);
@@ -307,27 +307,16 @@ fn pager_create_basic() {
 #[test]
 fn pager_create_larger_page_size() {
     let tmp = TempPath::new();
-    let p = Pager::create(tmp.path(), 12).unwrap(); // 4096 bytes
+    let p = Pager::<4096>::create(tmp.path()).unwrap();
     assert_eq!(p.page_size(), 4096);
-}
-
-#[test]
-fn pager_create_page_size_too_small() {
-    let tmp = TempPath::new();
-    for log2 in [0u32, 5, 9] {
-        assert!(matches!(
-            Pager::create(tmp.path(), log2),
-            Err(MappedPageError::InvalidPageSize)
-        ));
-    }
 }
 
 #[test]
 fn pager_create_existing_file_fails() {
     let tmp = TempPath::new();
-    Pager::create(tmp.path(), 10).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
     assert!(matches!(
-        Pager::create(tmp.path(), 10),
+        Pager::<1024>::create(tmp.path()),
         Err(MappedPageError::Io(_))
     ));
 }
@@ -336,7 +325,7 @@ fn pager_create_existing_file_fails() {
 fn pager_open_nonexistent_fails() {
     let tmp = TempPath::new();
     assert!(matches!(
-        Pager::open(tmp.path()),
+        Pager::<1024>::open(tmp.path()),
         Err(MappedPageError::Io(_))
     ));
 }
@@ -344,17 +333,27 @@ fn pager_open_nonexistent_fails() {
 #[test]
 fn pager_open_recovers_state() {
     let tmp = TempPath::new();
-    Pager::create(tmp.path(), 10).unwrap();
-    let p = Pager::open(tmp.path()).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.page_size(), 1024);
     assert_eq!(p.page_count(), 4);
     assert_eq!(p.free_page_count(), 1);
 }
 
 #[test]
+fn pager_open_wrong_page_size_fails() {
+    let tmp = TempPath::new();
+    Pager::<1024>::create(tmp.path()).unwrap();
+    assert!(matches!(
+        Pager::<4096>::open(tmp.path()),
+        Err(MappedPageError::InvalidPageSize)
+    ));
+}
+
+#[test]
 fn pager_alloc_returns_data_page() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc().unwrap();
     assert!(
         id.0 >= FIRST_DATA_PAGE,
@@ -365,9 +364,9 @@ fn pager_alloc_returns_data_page() {
 #[test]
 fn pager_alloc_multiple_distinct_ids() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     // 1 initial free page, then grows to accommodate more
-    let ids: Vec<PageId> = (0..5).map(|_| p.alloc().unwrap()).collect();
+    let ids: Vec<PageId<1024>> = (0..5).map(|_| p.alloc().unwrap()).collect();
     let mut sorted: Vec<u64> = ids.iter().map(|id| id.0).collect();
     sorted.sort_unstable();
     sorted.dedup();
@@ -378,7 +377,7 @@ fn pager_alloc_multiple_distinct_ids() {
 #[test]
 fn pager_alloc_exhaustion_triggers_grow() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     assert_eq!(p.page_count(), 4);
     p.alloc().unwrap(); // last free page (3)
     assert_eq!(p.free_page_count(), 0);
@@ -390,7 +389,7 @@ fn pager_alloc_exhaustion_triggers_grow() {
 #[test]
 fn pager_page_count_doubles_each_grow() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     // exhaust and grow twice
     while p.free_page_count() > 0 {
         p.alloc().unwrap();
@@ -407,7 +406,7 @@ fn pager_page_count_doubles_each_grow() {
 #[test]
 fn pager_free_returns_page_to_pool() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc().unwrap();
     assert_eq!(p.free_page_count(), 0);
     p.free(id).unwrap();
@@ -419,7 +418,7 @@ fn pager_free_returns_page_to_pool() {
 #[test]
 fn pager_free_reserved_pages_error() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     for i in 0..FIRST_DATA_PAGE {
         assert!(matches!(
             p.free(PageId(i)),
@@ -431,7 +430,7 @@ fn pager_free_reserved_pages_error() {
 #[test]
 fn pager_free_out_of_bounds_error() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     assert!(matches!(
         p.free(PageId(4)),
         Err(MappedPageError::OutOfBounds)
@@ -445,7 +444,7 @@ fn pager_free_out_of_bounds_error() {
 #[test]
 fn pager_double_free_error() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc().unwrap();
     p.free(id).unwrap();
     assert!(matches!(p.free(id), Err(MappedPageError::DoubleFree)));
@@ -455,7 +454,7 @@ fn pager_double_free_error() {
 #[test]
 fn pager_get_page_reserved_error() {
     let tmp = TempPath::new();
-    let p = Pager::create(tmp.path(), 10).unwrap();
+    let p = Pager::<1024>::create(tmp.path()).unwrap();
     for i in 0..FIRST_DATA_PAGE {
         assert!(matches!(
             PageId(i).get(&p),
@@ -467,7 +466,7 @@ fn pager_get_page_reserved_error() {
 #[test]
 fn pager_get_page_out_of_bounds_error() {
     let tmp = TempPath::new();
-    let p = Pager::create(tmp.path(), 10).unwrap();
+    let p = Pager::<1024>::create(tmp.path()).unwrap();
     assert!(matches!(
         PageId(4).get(&p),
         Err(MappedPageError::OutOfBounds)
@@ -481,7 +480,7 @@ fn pager_get_page_out_of_bounds_error() {
 #[test]
 fn pager_get_page_mut_write_then_read() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc().unwrap();
     id.get_mut(&mut p).unwrap().as_bytes_mut().fill(0xAB);
     assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0xAB));
@@ -490,7 +489,7 @@ fn pager_get_page_mut_write_then_read() {
 #[test]
 fn pager_page_len_equals_page_size() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc().unwrap();
     assert_eq!(id.get(&p).unwrap().len(), 1024);
 }
@@ -499,19 +498,19 @@ fn pager_page_len_equals_page_size() {
 fn pager_data_persists_across_reopen() {
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc().unwrap();
         id.get_mut(&mut p).unwrap().as_bytes_mut().fill(0x5A);
         id
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0x5A));
 }
 
 #[test]
 fn pager_grow_preserves_existing_page_data() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc().unwrap(); // page 3; exhausts capacity
     id.get_mut(&mut p).unwrap().as_bytes_mut().fill(0xCC);
     p.alloc().unwrap(); // triggers grow and remap
@@ -522,7 +521,7 @@ fn pager_grow_preserves_existing_page_data() {
 fn pager_alloc_free_sequence_correct_after_reopen() {
     let tmp = TempPath::new();
     let kept = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let a = p.alloc().unwrap(); // page 3
         let _b = p.alloc().unwrap(); // grows; page 4
         let c = p.alloc().unwrap(); // page 5
@@ -534,7 +533,7 @@ fn pager_alloc_free_sequence_correct_after_reopen() {
         // free: page 3's old slot is now d, page 5 is free
         d
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.page_count(), 8);
     assert!(kept.get(&p).is_ok());
 }
@@ -548,14 +547,14 @@ fn pager_alloc_free_sequence_correct_after_reopen() {
 fn crash_corrupt_active_meta_falls_back_to_alternate() {
     let tmp = TempPath::new();
     {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         // commit: B gets new state (page 3 allocated), superblock → B
         p.alloc().unwrap();
     }
     // Active = B.  Corrupt B's embedded checksum → B fails on next open.
     zero_range(tmp.path(), meta_checksum_offset(MetaSelector::B, 1024), 4);
 
-    let mut p = Pager::open(tmp.path()).unwrap();
+    let mut p = Pager::<1024>::open(tmp.path()).unwrap();
     // Recovery must use A, which has the pre-alloc state.
     assert_eq!(p.active_meta_selector(), MetaSelector::A);
     assert_eq!(p.free_page_count(), 1); // page 3 free again
@@ -566,13 +565,13 @@ fn crash_corrupt_active_meta_falls_back_to_alternate() {
 fn crash_corrupt_inactive_meta_has_no_effect() {
     let tmp = TempPath::new();
     {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         p.alloc().unwrap(); // active → B
     }
     // Corrupt the inactive page (A) — this should be irrelevant.
     zero_range(tmp.path(), meta_checksum_offset(MetaSelector::A, 1024), 4);
 
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.active_meta_selector(), MetaSelector::B);
     assert_eq!(p.free_page_count(), 0); // page 3 still allocated
 }
@@ -580,11 +579,11 @@ fn crash_corrupt_inactive_meta_has_no_effect() {
 #[test]
 fn crash_both_meta_corrupt_returns_error() {
     let tmp = TempPath::new();
-    Pager::create(tmp.path(), 10).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
     zero_range(tmp.path(), meta_checksum_offset(MetaSelector::A, 1024), 4);
     zero_range(tmp.path(), meta_checksum_offset(MetaSelector::B, 1024), 4);
     assert!(matches!(
-        Pager::open(tmp.path()),
+        Pager::<1024>::open(tmp.path()),
         Err(MappedPageError::CorruptMetadata)
     ));
 }
@@ -592,10 +591,10 @@ fn crash_both_meta_corrupt_returns_error() {
 #[test]
 fn crash_corrupt_superblock_magic() {
     let tmp = TempPath::new();
-    Pager::create(tmp.path(), 10).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
     zero_range(tmp.path(), 0, 8); // zero the magic bytes
     assert!(matches!(
-        Pager::open(tmp.path()),
+        Pager::<1024>::open(tmp.path()),
         Err(MappedPageError::CorruptSuperblock)
     ));
 }
@@ -603,10 +602,10 @@ fn crash_corrupt_superblock_magic() {
 #[test]
 fn crash_corrupt_superblock_version_major() {
     let tmp = TempPath::new();
-    Pager::create(tmp.path(), 10).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
     write_at(tmp.path(), 4, &[0xFF]); // byte 4 = version major
     assert!(matches!(
-        Pager::open(tmp.path()),
+        Pager::<1024>::open(tmp.path()),
         Err(MappedPageError::CorruptSuperblock)
     ));
 }
@@ -614,10 +613,10 @@ fn crash_corrupt_superblock_version_major() {
 #[test]
 fn crash_corrupt_superblock_selector_byte() {
     let tmp = TempPath::new();
-    Pager::create(tmp.path(), 10).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
     write_at(tmp.path(), 12, &[0xFF]); // byte 12 = active_meta; 0xFF is invalid
     assert!(matches!(
-        Pager::open(tmp.path()),
+        Pager::<1024>::open(tmp.path()),
         Err(MappedPageError::CorruptSuperblock)
     ));
 }
@@ -626,7 +625,7 @@ fn crash_corrupt_superblock_selector_byte() {
 fn crash_superblock_meta_checksum_mismatch_falls_back() {
     let tmp = TempPath::new();
     {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         p.alloc().unwrap(); // active → B; page 3 allocated
     }
     // Zero the superblock's meta_checksum field (bytes 16-19).
@@ -634,7 +633,7 @@ fn crash_superblock_meta_checksum_mismatch_falls_back() {
     zero_range(tmp.path(), 16, 4);
 
     // B fails the superblock-checksum cross-check; falls back to A.
-    let mut p = Pager::open(tmp.path()).unwrap();
+    let mut p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.active_meta_selector(), MetaSelector::A);
     assert_eq!(p.free_page_count(), 1);
     assert_eq!(p.alloc().unwrap().0, 3);
@@ -647,7 +646,7 @@ fn crash_superblock_meta_checksum_mismatch_falls_back() {
 fn crash_between_meta_write_and_superblock_flip() {
     let tmp = TempPath::new();
     // Create: active = A, page 3 free.
-    Pager::create(tmp.path(), 10).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
 
     // Manually write a "newer" committed-looking MetaPage to B (page 3
     // allocated, generation bumped) — as if commit step 1 completed then
@@ -662,7 +661,7 @@ fn crash_between_meta_write_and_superblock_flip() {
     }
     // Superblock still says active = A with original checksum.
 
-    let mut p = Pager::open(tmp.path()).unwrap();
+    let mut p = Pager::<1024>::open(tmp.path()).unwrap();
     // Must use A: the uncommitted B is ignored.
     assert_eq!(p.active_meta_selector(), MetaSelector::A);
     assert_eq!(p.free_page_count(), 1);
@@ -673,11 +672,11 @@ fn crash_between_meta_write_and_superblock_flip() {
 fn crash_committed_alloc_survives_reopen() {
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         p.alloc().unwrap()
     };
     // Reopen: page must still be allocated.
-    let mut p = Pager::open(tmp.path()).unwrap();
+    let mut p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.free_page_count(), 0);
     // Freeing it must succeed (proves it was allocated, not silently lost).
     p.free(id).unwrap();
@@ -689,12 +688,12 @@ fn crash_committed_data_survives_reopen() {
     const PAT: u8 = 0xA5;
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc().unwrap();
         id.get_mut(&mut p).unwrap().as_bytes_mut().fill(PAT);
         id
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == PAT));
 }
 
@@ -702,11 +701,11 @@ fn crash_committed_data_survives_reopen() {
 fn crash_grow_survives_reopen() {
     let tmp = TempPath::new();
     {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         p.alloc().unwrap(); // exhaust
         p.alloc().unwrap(); // grow 4 → 8
     }
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.page_count(), 8);
     // first alloc took page 3; grow added pages 4-7; second alloc took page 4 → 3 free
     assert_eq!(p.free_page_count(), 3);
@@ -717,7 +716,7 @@ fn crash_multiple_grows_survive_reopen() {
     let tmp = TempPath::new();
     let alloc_count;
     {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         // grow twice: 4 → 8 → 16
         let mut n = 0u32;
         while p.page_count() < 16 {
@@ -726,12 +725,12 @@ fn crash_multiple_grows_survive_reopen() {
         }
         alloc_count = n;
         // write a marker to the last allocated page
-        let last_id = PageId(FIRST_DATA_PAGE + alloc_count as u64 - 1);
+        let last_id = PageId::<1024>(FIRST_DATA_PAGE + alloc_count as u64 - 1);
         last_id.get_mut(&mut p).unwrap().as_bytes_mut()[0] = 0xBB;
     }
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.page_count(), 16);
-    let last_id = PageId(FIRST_DATA_PAGE + alloc_count as u64 - 1);
+    let last_id = PageId::<1024>(FIRST_DATA_PAGE + alloc_count as u64 - 1);
     assert_eq!(last_id.get(&p).unwrap().as_bytes()[0], 0xBB);
 }
 
@@ -895,7 +894,7 @@ fn dir_blocks_bad_checksum_rejected() {
 #[test]
 fn protected_alloc_returns_id() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
     assert_eq!(id.0, 0);
 }
@@ -903,7 +902,7 @@ fn protected_alloc_returns_id() {
 #[test]
 fn protected_alloc_multiple_distinct_sequential_ids() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let ids: Vec<u64> = (0..4).map(|_| p.alloc_protected().unwrap().0).collect();
     assert_eq!(ids, [0, 1, 2, 3]);
 }
@@ -911,7 +910,7 @@ fn protected_alloc_multiple_distinct_sequential_ids() {
 #[test]
 fn protected_page_len_equals_page_size() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
     assert_eq!(id.get(&p).unwrap().len(), 1024);
 }
@@ -919,7 +918,7 @@ fn protected_page_len_equals_page_size() {
 #[test]
 fn protected_read_initial_content_is_zero() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
     assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0));
 }
@@ -927,7 +926,7 @@ fn protected_read_initial_content_is_zero() {
 #[test]
 fn protected_write_not_visible_before_commit() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
     {
         let mut w = id.get_mut(&mut p).unwrap();
@@ -941,7 +940,7 @@ fn protected_write_not_visible_before_commit() {
 #[test]
 fn protected_write_visible_after_commit() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
     let mut w = id.get_mut(&mut p).unwrap();
     w.page_mut().as_bytes_mut().fill(0xAB);
@@ -952,7 +951,7 @@ fn protected_write_visible_after_commit() {
 #[test]
 fn protected_second_write_overwrites_first() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
 
     let mut w = id.get_mut(&mut p).unwrap();
@@ -969,7 +968,7 @@ fn protected_second_write_overwrites_first() {
 #[test]
 fn protected_alternating_writes_toggle_active_slot() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
 
     // initial: active_slot = 0
@@ -994,7 +993,7 @@ fn protected_alternating_writes_toggle_active_slot() {
 #[test]
 fn protected_free_releases_backing_pages() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     p.alloc_protected().unwrap(); // first alloc: creates dir block + backing pages
     let id = p.alloc_protected().unwrap(); // second alloc: reuses dir block, new backing pages
     // Measure free count AFTER the second alloc (and any grow it triggered).
@@ -1006,7 +1005,7 @@ fn protected_free_releases_backing_pages() {
 #[test]
 fn protected_double_free_error() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
     p.free_protected(id).unwrap();
     assert!(matches!(
@@ -1018,7 +1017,7 @@ fn protected_double_free_error() {
 #[test]
 fn protected_get_invalid_id_returns_out_of_bounds() {
     let tmp = TempPath::new();
-    let p = Pager::create(tmp.path(), 10).unwrap();
+    let p = Pager::<1024>::create(tmp.path()).unwrap();
     // No dir blocks exist yet; any slot index is out of bounds.
     assert!(matches!(
         ProtectedPageId(0).get(&p),
@@ -1033,7 +1032,7 @@ fn protected_get_invalid_id_returns_out_of_bounds() {
 #[test]
 fn protected_get_freed_slot_returns_out_of_bounds() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id = p.alloc_protected().unwrap();
     p.free_protected(id).unwrap();
     assert!(matches!(id.get(&p), Err(MappedPageError::OutOfBounds)));
@@ -1042,7 +1041,7 @@ fn protected_get_freed_slot_returns_out_of_bounds() {
 #[test]
 fn protected_slot_reuse_after_free() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
     let id0 = p.alloc_protected().unwrap();
 
     // Write something, commit, then free.
@@ -1062,10 +1061,10 @@ fn protected_slot_reuse_after_free() {
 fn protected_alloc_survives_reopen() {
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         p.alloc_protected().unwrap()
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     // Slot must be accessible and marked in-use after reopen.
     assert!(id.get(&p).is_ok());
 }
@@ -1074,14 +1073,14 @@ fn protected_alloc_survives_reopen() {
 fn protected_write_survives_reopen() {
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc_protected().unwrap();
         let mut w = id.get_mut(&mut p).unwrap();
         w.page_mut().as_bytes_mut().fill(0x5C);
         w.commit().unwrap();
         id
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0x5C));
 }
 
@@ -1091,7 +1090,7 @@ fn protected_multiple_writes_survive_reopen() {
     const PAT2: u8 = 0xBB;
     let tmp = TempPath::new();
     let (id0, id1) = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id0 = p.alloc_protected().unwrap();
         let id1 = p.alloc_protected().unwrap();
 
@@ -1104,7 +1103,7 @@ fn protected_multiple_writes_survive_reopen() {
         w.commit().unwrap();
         (id0, id1)
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert!(id0.get(&p).unwrap().as_bytes().iter().all(|&b| b == PAT1));
     assert!(id1.get(&p).unwrap().as_bytes().iter().all(|&b| b == PAT2));
 }
@@ -1113,20 +1112,20 @@ fn protected_multiple_writes_survive_reopen() {
 fn protected_free_survives_reopen() {
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc_protected().unwrap();
         p.free_protected(id).unwrap();
         id
     };
     // Slot is free after reopen; getting it must fail.
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert!(matches!(id.get(&p), Err(MappedPageError::OutOfBounds)));
 }
 
 #[test]
 fn protected_normal_alloc_and_protected_alloc_coexist() {
     let tmp = TempPath::new();
-    let mut p = Pager::create(tmp.path(), 10).unwrap();
+    let mut p = Pager::<1024>::create(tmp.path()).unwrap();
 
     let normal_id = p.alloc().unwrap();
     let prot_id = p.alloc_protected().unwrap();
@@ -1188,7 +1187,7 @@ fn crash_corrupt_active_dir_page_falls_back_to_inactive() {
 
     // Commit a write so the active dir page records active_slot=1.
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc_protected().unwrap();
         let mut w = id.get_mut(&mut p).unwrap();
         w.page_mut().as_bytes_mut().fill(0xAB);
@@ -1203,7 +1202,7 @@ fn crash_corrupt_active_dir_page_falls_back_to_inactive() {
     };
 
     // Reopen: active dir page is corrupt → fall back to inactive (old state, slot=0).
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     // Slot 0 of the fallback page has active_slot=0 (pre-write state).
     assert_eq!(p.protected_active_slot(id), 0);
     // The active physical page (page_a of data) was never written → zeros.
@@ -1214,14 +1213,14 @@ fn crash_corrupt_active_dir_page_falls_back_to_inactive() {
 fn crash_corrupt_both_dir_pages_returns_error() {
     let tmp = TempPath::new();
     {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         p.alloc_protected().unwrap();
         let (dir_pa, dir_pb, _) = p.dir_block_pages(0);
         zero_range(tmp.path(), phys_page_checksum_offset(dir_pa, 1024), 4);
         zero_range(tmp.path(), phys_page_checksum_offset(dir_pb, 1024), 4);
     }
     assert!(matches!(
-        Pager::open(tmp.path()),
+        Pager::<1024>::open(tmp.path()),
         Err(MappedPageError::CorruptProtectedDirectory)
     ));
 }
@@ -1234,7 +1233,7 @@ fn crash_between_dir_write_and_page0_update() {
     let tmp = TempPath::new();
 
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc_protected().unwrap();
         // After alloc_protected: block.active = B (dir_pb).
         // Backing pages: data_pa is active (slot 0).
@@ -1274,7 +1273,7 @@ fn crash_between_dir_write_and_page0_update() {
     };
 
     // Reopen: page 0 says active dir = B (dir_pb), which has the pre-write state.
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     // active_slot = 0 → data_pa is active → zeros.
     assert_eq!(p.protected_active_slot(id), 0);
     assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0));
@@ -1284,14 +1283,14 @@ fn crash_between_dir_write_and_page0_update() {
 fn crash_committed_write_survives_reopen() {
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc_protected().unwrap();
         let mut w = id.get_mut(&mut p).unwrap();
         w.page_mut().as_bytes_mut().fill(0xDD);
         w.commit().unwrap();
         id
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert!(id.get(&p).unwrap().as_bytes().iter().all(|&b| b == 0xDD));
 }
 
@@ -1299,12 +1298,12 @@ fn crash_committed_write_survives_reopen() {
 fn crash_committed_free_survives_reopen() {
     let tmp = TempPath::new();
     let id = {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         let id = p.alloc_protected().unwrap();
         p.free_protected(id).unwrap();
         id
     };
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert!(matches!(id.get(&p), Err(MappedPageError::OutOfBounds)));
 }
 
@@ -1312,13 +1311,13 @@ fn crash_committed_free_survives_reopen() {
 fn crash_corrupt_page0_dir_section_returns_error() {
     let tmp = TempPath::new();
     {
-        let mut p = Pager::create(tmp.path(), 10).unwrap();
+        let mut p = Pager::<1024>::create(tmp.path()).unwrap();
         p.alloc_protected().unwrap(); // writes dir block ref to page 0
     }
     // Corrupt the dir section checksum at the end of page 0.
     zero_range(tmp.path(), 1024 - 4, 4);
     assert!(matches!(
-        Pager::open(tmp.path()),
+        Pager::<1024>::open(tmp.path()),
         Err(MappedPageError::CorruptDirectoryIndex)
     ));
 }
@@ -1328,10 +1327,10 @@ fn crash_old_file_without_dir_section_opens_cleanly() {
     // Simulate a file created before protected pages were added:
     // page 0 bytes 20..1024 are all zeros (no dir section, no checksum).
     let tmp = TempPath::new();
-    Pager::create(tmp.path(), 10).unwrap();
+    Pager::<1024>::create(tmp.path()).unwrap();
     // Zero out everything after the 20-byte superblock in page 0.
     zero_range(tmp.path(), 20, 1024 - 20);
     // Should open successfully with no directory blocks.
-    let p = Pager::open(tmp.path()).unwrap();
+    let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.free_page_count(), 1);
 }

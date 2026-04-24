@@ -27,6 +27,13 @@
 //! The active metadata page is **never** overwritten in place.  Recovery on open
 //! validates checksums and falls back to the alternate page if needed.
 //!
+//! # Page-size safety
+//!
+//! `Pager`, `PageId`, and `ProtectedPageId` are all generic over a const
+//! `PAGE_SIZE: usize`.  A `PageId<1024>` cannot be passed to a `Pager<4096>`
+//! — the compiler rejects the mismatch.  `PAGE_SIZE` must be a power of two
+//! and at least 1024; violating either constraint is a compile error.
+//!
 //! # Reference lifetime and grow safety
 //!
 //! `&MappedPage` and `&mut MappedPage` are tied to the *borrow* of the `Pager`
@@ -37,18 +44,12 @@
 //!
 //! ```compile_fail
 //! # use mappedpages::{Pager, PageId};
-//! let mut pager = Pager::open("db.bin").unwrap();
+//! let mut pager = Pager::<4096>::open("db.bin").unwrap();
 //! let id = pager.alloc().unwrap();
 //! let page = id.get(&pager).unwrap(); // borrows pager
 //! pager.alloc().unwrap();             // ERROR: pager already borrowed
 //! let _ = page;
 //! ```
-//!
-//! # Minimum page size
-//!
-//! Page size must be at least 1024 bytes (`page_size_log2 >= 10`).  This
-//! ensures each metadata page has enough room for the header, a bitmap
-//! large enough to be useful, and the trailing checksum.
 
 mod allocator;
 mod error;

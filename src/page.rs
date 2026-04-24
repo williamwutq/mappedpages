@@ -1,8 +1,12 @@
 use crate::{MappedPageError, Pager};
 
 /// Opaque handle to a page.  Page 0-2 are reserved and never returned by `alloc`.
+///
+/// The const generic `PAGE_SIZE` is the page size in bytes that this handle
+/// belongs to.  A `PageId<1024>` cannot be used with a `Pager<4096>` — the
+/// compiler rejects the mismatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PageId(pub u64);
+pub struct PageId<const PAGE_SIZE: usize>(pub u64);
 
 /// A fixed-size view into one page of the memory map.
 ///
@@ -17,14 +21,17 @@ pub struct PageId(pub u64);
 #[repr(transparent)]
 pub struct MappedPage([u8]);
 
-impl PageId {
+impl<const PAGE_SIZE: usize> PageId<PAGE_SIZE> {
     /// Borrow the page contents immutably.
-    pub fn get<'a>(&self, pager: &'a Pager) -> Result<&'a MappedPage, MappedPageError> {
+    pub fn get<'a>(&self, pager: &'a Pager<PAGE_SIZE>) -> Result<&'a MappedPage, MappedPageError> {
         pager.get_page(*self)
     }
 
     /// Borrow the page contents mutably.
-    pub fn get_mut<'a>(&self, pager: &'a mut Pager) -> Result<&'a mut MappedPage, MappedPageError> {
+    pub fn get_mut<'a>(
+        &self,
+        pager: &'a mut Pager<PAGE_SIZE>,
+    ) -> Result<&'a mut MappedPage, MappedPageError> {
         pager.get_page_mut(*self)
     }
 }

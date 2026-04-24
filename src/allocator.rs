@@ -54,59 +54,65 @@ pub trait PageAllocator<AllocatedType: PageHandle<Self>>: Sized {
 
 // ── PageId ────────────────────────────────────────────────────────────────────
 
-impl PageHandle<Pager> for PageId {
+impl<const PAGE_SIZE: usize> PageHandle<Pager<PAGE_SIZE>> for PageId<PAGE_SIZE> {
     type Error = MappedPageError;
     type Mut<'a> = &'a mut MappedPage;
 
-    fn get<'a>(&self, pager: &'a Pager) -> Result<&'a MappedPage, MappedPageError> {
+    fn get<'a>(&self, pager: &'a Pager<PAGE_SIZE>) -> Result<&'a MappedPage, MappedPageError> {
         pager.get_page(*self)
     }
 
-    fn get_mut<'a>(&self, pager: &'a mut Pager) -> Result<&'a mut MappedPage, MappedPageError> {
+    fn get_mut<'a>(
+        &self,
+        pager: &'a mut Pager<PAGE_SIZE>,
+    ) -> Result<&'a mut MappedPage, MappedPageError> {
         pager.get_page_mut(*self)
     }
 }
 
-impl PageAllocator<PageId> for Pager {
+impl<const PAGE_SIZE: usize> PageAllocator<PageId<PAGE_SIZE>> for Pager<PAGE_SIZE> {
     type Error = MappedPageError;
 
-    fn alloc(&mut self) -> Result<PageId, MappedPageError> {
+    fn alloc(&mut self) -> Result<PageId<PAGE_SIZE>, MappedPageError> {
         Pager::alloc(self)
     }
 
-    fn free(&mut self, id: PageId) -> Result<(), MappedPageError> {
+    fn free(&mut self, id: PageId<PAGE_SIZE>) -> Result<(), MappedPageError> {
         Pager::free(self, id)
     }
 }
 
 // ── ProtectedPageId ───────────────────────────────────────────────────────────
 
-impl PageHandle<Pager> for ProtectedPageId {
+impl<const PAGE_SIZE: usize> PageHandle<Pager<PAGE_SIZE>> for ProtectedPageId<PAGE_SIZE> {
     type Error = MappedPageError;
     /// A [`ProtectedPageWriter`] that must be [`commit`](ProtectedPageWriter::commit)ted
     /// to make the write crash-consistent.
-    type Mut<'a> = ProtectedPageWriter<'a>;
+    type Mut<'a> = ProtectedPageWriter<'a, PAGE_SIZE>;
 
-    fn get<'a>(&self, pager: &'a Pager) -> Result<&'a MappedPage, MappedPageError> {
+    fn get<'a>(
+        &self,
+        pager: &'a Pager<PAGE_SIZE>,
+    ) -> Result<&'a MappedPage, MappedPageError> {
         pager.get_protected_page(*self)
     }
 
     fn get_mut<'a>(
         &self,
-        pager: &'a mut Pager,
-    ) -> Result<ProtectedPageWriter<'a>, MappedPageError> {
+        pager: &'a mut Pager<PAGE_SIZE>,
+    ) -> Result<ProtectedPageWriter<'a, PAGE_SIZE>, MappedPageError> {
         pager.get_protected_page_mut(*self)
     }
 }
 
-impl PageAllocator<ProtectedPageId> for Pager {
+impl<const PAGE_SIZE: usize> PageAllocator<ProtectedPageId<PAGE_SIZE>> for Pager<PAGE_SIZE> {
     type Error = MappedPageError;
 
-    fn alloc(&mut self) -> Result<ProtectedPageId, MappedPageError> {
+    fn alloc(&mut self) -> Result<ProtectedPageId<PAGE_SIZE>, MappedPageError> {
         Pager::alloc_protected(self)
     }
 
-    fn free(&mut self, id: ProtectedPageId) -> Result<(), MappedPageError> {
+    fn free(&mut self, id: ProtectedPageId<PAGE_SIZE>) -> Result<(), MappedPageError> {
         Pager::free_protected(self, id)
     }
 }

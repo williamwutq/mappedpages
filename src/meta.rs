@@ -43,8 +43,6 @@ pub(crate) const MAGIC: u64 = u64::from_le_bytes([
 ]);
 /// First page index that may be returned to callers (pages 0-2 are reserved).
 pub(crate) const FIRST_DATA_PAGE: u64 = 3;
-/// Minimum allowed `page_size_log2` (2^10 = 1024 bytes).
-pub(crate) const MIN_PAGE_SIZE_LOG2: u32 = 10;
 
 /// Byte offset in page 0 where the directory block array begins (after the 20-byte superblock).
 pub(crate) const PAGE0_DIR_OFFSET: usize = 20;
