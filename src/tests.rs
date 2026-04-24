@@ -1699,3 +1699,226 @@ fn iter_survives_reopen() {
     expected.sort_unstable();
     assert_eq!(iterated, expected);
 }
+
+// ── iter_allocated_pages / iter_allocated_protected_pages separation tests ────
+
+#[test]
+fn iter_regular_excludes_protected_backing_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    // Allocate a protected page — this reserves physical backing pages.
+    let _pid = pager.alloc_protected().unwrap();
+    // Regular iterator must yield nothing (no regular pages allocated).
+    let regular: Vec<_> = pager.iter_allocated_pages().collect();
+    assert!(
+        regular.is_empty(),
+        "regular iterator yielded a protected backing page: {regular:?}"
+    );
+}
+
+#[test]
+fn iter_regular_excludes_dir_block_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let _pid = pager.alloc_protected().unwrap();
+    // All allocated physical pages should be internal; none regular.
+    let regular: Vec<_> = pager.iter_allocated_pages().collect();
+    assert!(
+        regular.is_empty(),
+        "regular iterator exposed dir-block pages: {regular:?}"
+    );
+}
+
+#[test]
+fn iter_regular_and_protected_together_are_disjoint() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let reg_id = pager.alloc().unwrap();
+    let prot_id = pager.alloc_protected().unwrap();
+
+    let regular: Vec<_> = pager.iter_allocated_pages().collect();
+    let protected: Vec<_> = pager.iter_allocated_protected_pages().collect();
+
+    assert_eq!(regular, vec![reg_id], "regular iterator mismatch");
+    assert_eq!(protected, vec![prot_id], "protected iterator mismatch");
+
+    // No physical page id should appear in both sets.
+    for r in &regular {
+        let prot_phys = pager.protected_backing_pages(prot_id);
+        assert!(
+            r.0 != prot_phys.0 && r.0 != prot_phys.1,
+            "regular page {r:?} overlaps protected backing pages"
+        );
+    }
+}
+
+#[test]
+fn iter_protected_empty_when_no_protected_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    pager.alloc_bulk(3).unwrap();
+    let protected: Vec<_> = pager.iter_allocated_protected_pages().collect();
+    assert!(
+        protected.is_empty(),
+        "protected iterator should be empty: {protected:?}"
+    );
+}
+
+#[test]
+fn iter_protected_yields_in_use_slots_only() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let p0 = pager.alloc_protected().unwrap();
+    let p1 = pager.alloc_protected().unwrap();
+    let p2 = pager.alloc_protected().unwrap();
+    // Free the middle one.
+    pager.free_protected(p1).unwrap();
+    let mut iterated: Vec<_> = pager.iter_allocated_protected_pages().collect();
+    iterated.sort_unstable();
+    assert_eq!(iterated, vec![p0, p2]);
+}
+
+#[test]
+fn iter_protected_count_matches_alloc_count() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    pager.alloc_protected().unwrap();
+    pager.alloc_protected().unwrap();
+    pager.alloc_protected().unwrap();
+    assert_eq!(pager.iter_allocated_protected_pages().count(), 3);
+}
+
+#[test]
+fn iter_protected_empty_after_free_all() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_protected_bulk(3).unwrap();
+    pager.free_protected_bulk(ids).unwrap();
+    assert!(
+        pager
+            .iter_allocated_protected_pages()
+            .collect::<Vec<_>>()
+            .is_empty()
+    );
+}
+
+#[test]
+fn iter_protected_survives_reopen() {
+    let tmp = TempPath::new();
+    let ids = {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        pager.alloc_protected_bulk(2).unwrap()
+    };
+    let pager = Pager::<4096>::open(tmp.path()).unwrap();
+    let mut iterated: Vec<_> = pager.iter_allocated_protected_pages().collect();
+    iterated.sort_unstable();
+    let mut expected = ids.clone();
+    expected.sort_unstable();
+    assert_eq!(iterated, expected);
+}
+
+// ── alloc_protected_bulk / free_protected_bulk tests ─────────────────────────
+
+#[test]
+fn bulk_protected_alloc_zero_returns_empty() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    assert!(pager.alloc_protected_bulk(0).unwrap().is_empty());
+}
+
+#[test]
+fn bulk_protected_alloc_returns_distinct_ids() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_protected_bulk(3).unwrap();
+    assert_eq!(ids.len(), 3);
+    let mut sorted = ids.clone();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 3, "all ids must be distinct");
+}
+
+#[test]
+fn bulk_protected_alloc_pages_are_accessible() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_protected_bulk(3).unwrap();
+    for id in &ids {
+        assert!(id.get(&pager).is_ok());
+    }
+}
+
+#[test]
+fn bulk_protected_alloc_persists_across_reopen() {
+    let tmp = TempPath::new();
+    let ids = {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        pager.alloc_protected_bulk(2).unwrap()
+    };
+    let pager = Pager::<4096>::open(tmp.path()).unwrap();
+    for id in &ids {
+        assert!(id.get(&pager).is_ok());
+    }
+}
+
+#[test]
+fn bulk_protected_free_zero_is_ok() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    assert!(pager.free_protected_bulk(vec![]).is_ok());
+}
+
+#[test]
+fn bulk_protected_free_releases_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_protected_bulk(3).unwrap();
+    let free_before = pager.free_page_count();
+    pager.free_protected_bulk(ids).unwrap();
+    // Each protected page frees 2 backing pages.
+    assert_eq!(pager.free_page_count(), free_before + 6);
+}
+
+#[test]
+fn bulk_protected_free_double_free_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_protected_bulk(2).unwrap();
+    pager.free_protected_bulk(ids.clone()).unwrap();
+    let result = pager.free_protected_bulk(ids);
+    assert!(matches!(result, Err(MappedPageError::DoubleFree)));
+}
+
+#[test]
+fn bulk_protected_free_duplicate_in_input_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_protected_bulk(1).unwrap();
+    let result = pager.free_protected_bulk(vec![ids[0], ids[0]]);
+    assert!(matches!(result, Err(MappedPageError::DoubleFree)));
+    // Page must still be allocated.
+    assert!(ids[0].get(&pager).is_ok());
+}
+
+#[test]
+fn bulk_protected_free_out_of_bounds_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let result = pager.free_protected_bulk(vec![ProtectedPageId(9999)]);
+    assert!(matches!(result, Err(MappedPageError::OutOfBounds)));
+}
+
+#[test]
+fn bulk_protected_free_atomic_no_partial_free_on_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_protected_bulk(2).unwrap();
+    let free_before = pager.free_page_count();
+    // Mix a valid id with an out-of-bounds one.
+    let result = pager.free_protected_bulk(vec![ids[0], ProtectedPageId(9999)]);
+    assert!(result.is_err());
+    assert_eq!(
+        pager.free_page_count(),
+        free_before,
+        "no pages should have been freed"
+    );
+}

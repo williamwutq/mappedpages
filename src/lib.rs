@@ -36,19 +36,34 @@
 //!
 //! # Bulk operations
 //!
-//! [`Pager::alloc_bulk`] and [`Pager::free_bulk`] allocate or free multiple pages
-//! in a single crash-safe metadata commit, reducing overhead for workloads that
-//! need many pages at once.  [`free_bulk`](Pager::free_bulk) validates all ids
-//! atomically before touching the bitmap — a single invalid id causes the whole
-//! call to fail without modifying any state.
+//! [`Pager::alloc_bulk`] and [`Pager::free_bulk`] allocate or free multiple
+//! regular pages in a single crash-safe metadata commit, reducing overhead for
+//! workloads that need many pages at once.  [`free_bulk`](Pager::free_bulk)
+//! validates all ids atomically before touching the bitmap — a single invalid
+//! id causes the whole call to fail without modifying any state.
+//!
+//! [`Pager::alloc_protected_bulk`] and [`Pager::free_protected_bulk`] do the
+//! same for protected pages.  Because each protected-page allocation requires
+//! multiple physical pages and directory commits, the bulk variant cannot batch
+//! everything into one commit; it does guarantee that on failure all
+//! already-allocated protected pages are freed (for alloc) and that all ids are
+//! validated before any page is freed (for free).
 //!
 //! # Page iteration
 //!
-//! [`Pager::iter_allocated_pages`] returns an [`AllocatedPageIter`] that traverses
-//! the allocation bitmap and yields a [`PageId`] for each allocated data page.
-//! Reserved pages 0–2 are never included.  The iterator holds an immutable borrow
-//! on the pager, so allocation and deallocation are statically prevented while it
-//! is alive.
+//! [`Pager::iter_allocated_pages`] returns an [`AllocatedPageIter`] that
+//! traverses the allocation bitmap and yields a [`PageId`] for each allocated
+//! regular data page.  Internal protected-page resources (directory block pages
+//! and backing pages for in-use protected entries) are excluded.  Reserved
+//! pages 0–2 are never included.
+//!
+//! [`Pager::iter_allocated_protected_pages`] returns an
+//! [`AllocatedProtectedPageIter`] that traverses the protected-page directory
+//! and yields a [`ProtectedPageId`] for each in-use slot.  Regular data pages
+//! are never included.
+//!
+//! Both iterators hold an immutable borrow on the pager, so allocation and
+//! deallocation are statically prevented while either is alive.
 //!
 //! # Sub-page allocation
 //!
@@ -101,6 +116,6 @@ mod tests;
 pub use allocator::{PageAllocator, PageHandle};
 pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
-pub use pager::{AllocatedPageIter, Pager};
+pub use pager::{AllocatedPageIter, AllocatedProtectedPageIter, Pager};
 pub use protected::{ProtectedPageId, ProtectedPageWriter};
 pub use sub_allocator::{SubPageAllocator, SubPageId};

@@ -18,8 +18,8 @@ A crash-consistent, memory-mapped, file-backed fixed-size page provider for Rust
 - **CRC32 checksums** — every metadata page and directory block is protected by a CRC32 checksum.  On open, the library validates both copies and falls back to the alternate if one is corrupt.
 - **Sub-page allocation** — `SubPageAllocator` divides big pages into smaller uniform sub-pages, so callers don't have to implement their own bitmap-based slab allocators on top of the raw pages.
 - **Async I/O support** — async versions of allocation and deallocation methods are available with the "async" feature flag, enabling integration with async runtimes like Tokio.
-- **Bulk operations** — `alloc_bulk(count)` and `free_bulk(ids)` allocate or free multiple pages in a single crash-safe metadata commit, reducing overhead for workloads that need many pages at once. `free_bulk` validates all ids atomically so no partial state change occurs on error.
-- **Page iterator** — `iter_allocated_pages()` returns an `AllocatedPageIter` that traverses the allocation bitmap and yields every allocated data page, enabling efficient traversal for maintenance, backup, or analysis without loading any page data.
+- **Bulk operations** — `alloc_bulk(count)` and `free_bulk(ids)` allocate or free multiple regular pages in a single crash-safe metadata commit. `alloc_protected_bulk` and `free_protected_bulk` provide the same convenience for protected pages. Both `free_bulk` variants validate all ids atomically so no partial state change occurs on error.
+- **Page iterators** — `iter_allocated_pages()` returns an `AllocatedPageIter` over regular data pages (internal protected-page resources are excluded). `iter_allocated_protected_pages()` returns an `AllocatedProtectedPageIter` over in-use protected pages. The two iterators are strictly disjoint: neither leaks the other's pages.
 
 ## File layout
 
@@ -200,7 +200,7 @@ Note: Currently, the async methods block the async runtime thread due to underly
 
 ### Bulk operations
 
-`alloc_bulk` and `free_bulk` perform multiple allocations or deallocations with only a single crash-safe metadata commit at the end, reducing overhead compared to individual `alloc`/`free` calls.
+`alloc_bulk` and `free_bulk` perform multiple regular-page allocations or deallocations with only a single crash-safe metadata commit at the end, reducing overhead compared to individual `alloc`/`free` calls.  `free_bulk` validates all ids atomically before touching the bitmap — a single invalid id returns an error and leaves all pages unchanged.
 
 ```rust
 use mappedpages::Pager;
@@ -211,42 +211,50 @@ let mut pager = Pager::<4096>::create("data.bin")?;
 let ids = pager.alloc_bulk(10)?;
 assert_eq!(ids.len(), 10);
 
-// Write to each page.
-for id in &ids {
-    id.get_mut(&mut pager)?.as_bytes_mut().fill(0xAB);
-}
-
 // Free all 10 pages in one commit.
-// All ids are validated atomically before any pages are freed —
-// a single invalid id returns an error and leaves all pages unchanged.
 pager.free_bulk(ids)?;
 ```
 
-Async variants are also available under the "async" feature flag:
+`alloc_protected_bulk` and `free_protected_bulk` work the same way for protected pages.  Because each protected-page allocation involves multiple physical pages and directory commits, the operation cannot be batched into a single commit; it does guarantee that on failure all already-allocated protected pages are freed (alloc) and that all ids are validated before any page is freed (free).
+
+```rust
+let pids = pager.alloc_protected_bulk(5)?;
+pager.free_protected_bulk(pids)?;
+```
+
+Async variants are available under the `"async"` feature flag:
 
 ```rust
 let ids = pager.alloc_bulk_async(10).await?;
 pager.free_bulk_async(ids).await?;
+
+let pids = pager.alloc_protected_bulk_async(5).await?;
+pager.free_protected_bulk_async(pids).await?;
 ```
 
 ### Iterating allocated pages
 
-`iter_allocated_pages` traverses the allocation bitmap and yields a `PageId` for each allocated data page. Reserved pages 0–2 are never included. The iterator holds an immutable borrow on the pager, so `alloc` and `free` cannot be called while it is alive.
+`iter_allocated_pages` traverses the allocation bitmap and yields a `PageId` for each allocated **regular** data page.  Internal protected-page resources (directory block pages and backing pages for in-use protected entries) are excluded.  Reserved pages 0–2 are never included.  The iterator holds an immutable borrow on the pager.
+
+`iter_allocated_protected_pages` traverses the protected-page directory and yields a `ProtectedPageId` for each in-use slot.  Regular data pages are never included.  The two iterators are strictly disjoint.
 
 ```rust
 use mappedpages::Pager;
 
 let mut pager = Pager::<4096>::create("data.bin")?;
-pager.alloc_bulk(3)?;
+let _reg  = pager.alloc_bulk(3)?;
+let _prot = pager.alloc_protected_bulk(2)?;
 
-// Collect all allocated page ids.
-let allocated: Vec<_> = pager.iter_allocated_pages().collect();
-assert_eq!(allocated.len(), 3);
-
-// Iterate and read each page.
+// Iterate regular pages only.
 for id in pager.iter_allocated_pages() {
     let page = id.get(&pager)?;
-    println!("page {}: first byte = {}", id.0, page.as_bytes()[0]);
+    println!("regular page {}: first byte = {}", id.0, page.as_bytes()[0]);
+}
+
+// Iterate protected pages only.
+for pid in pager.iter_allocated_protected_pages() {
+    let page = pid.get(&pager)?;
+    println!("protected page {}: first byte = {}", pid.0, page.as_bytes()[0]);
 }
 ```
 
@@ -262,24 +270,33 @@ The central type.  All page handles hold a borrow on the `Pager` that produced t
 | `open` | `(path) -> Result<Self>` | Open and validate an existing file; fails if the on-disk page size ≠ `PAGE_SIZE` |
 | `alloc` | `(&mut self) -> Result<PageId<PAGE_SIZE>>` | Allocate a regular page; grows the file if needed |
 | `free` | `(&mut self, PageId<PAGE_SIZE>) -> Result<()>` | Free a regular page |
-| `alloc_bulk` | `(&mut self, usize) -> Result<Vec<PageId<PAGE_SIZE>>>` | Allocate `n` pages in one commit; grows as needed |
-| `free_bulk` | `(&mut self, Vec<PageId<PAGE_SIZE>>) -> Result<()>` | Free multiple pages in one commit; validates all ids atomically |
-| `iter_allocated_pages` | `(&self) -> AllocatedPageIter<'_, PAGE_SIZE>` | Iterator over all currently allocated data pages |
+| `alloc_bulk` | `(&mut self, usize) -> Result<Vec<PageId<PAGE_SIZE>>>` | Allocate `n` regular pages in one commit; grows as needed |
+| `free_bulk` | `(&mut self, Vec<PageId<PAGE_SIZE>>) -> Result<()>` | Free multiple regular pages in one commit; validates all ids atomically |
+| `iter_allocated_pages` | `(&self) -> AllocatedPageIter<'_, PAGE_SIZE>` | Iterator over allocated regular data pages (excludes internal protected resources) |
+| `iter_allocated_protected_pages` | `(&self) -> AllocatedProtectedPageIter<'_, PAGE_SIZE>` | Iterator over in-use protected pages |
 | `alloc_async` | `(&mut self) -> Result<PageId<PAGE_SIZE>>` | Async version of `alloc` (requires "async" feature) |
 | `free_async` | `(&mut self, PageId<PAGE_SIZE>) -> Result<()>` | Async version of `free` (requires "async" feature) |
 | `alloc_bulk_async` | `(&mut self, usize) -> Result<Vec<PageId<PAGE_SIZE>>>` | Async version of `alloc_bulk` (requires "async" feature) |
 | `free_bulk_async` | `(&mut self, Vec<PageId<PAGE_SIZE>>) -> Result<()>` | Async version of `free_bulk` (requires "async" feature) |
 | `alloc_protected` | `(&mut self) -> Result<ProtectedPageId<PAGE_SIZE>>` | Allocate a crash-consistent copy-on-write page |
 | `free_protected` | `(&mut self, ProtectedPageId<PAGE_SIZE>) -> Result<()>` | Free a protected page and both its backing copies |
+| `alloc_protected_bulk` | `(&mut self, usize) -> Result<Vec<ProtectedPageId<PAGE_SIZE>>>` | Allocate `n` protected pages; rolls back on failure |
+| `free_protected_bulk` | `(&mut self, Vec<ProtectedPageId<PAGE_SIZE>>) -> Result<()>` | Free multiple protected pages; validates all ids before freeing any |
 | `alloc_protected_async` | `(&mut self) -> Result<ProtectedPageId<PAGE_SIZE>>` | Async version of `alloc_protected` (requires "async" feature) |
 | `free_protected_async` | `(&mut self, ProtectedPageId<PAGE_SIZE>) -> Result<()>` | Async version of `free_protected` (requires "async" feature) |
+| `alloc_protected_bulk_async` | `(&mut self, usize) -> Result<Vec<ProtectedPageId<PAGE_SIZE>>>` | Async version of `alloc_protected_bulk` (requires "async" feature) |
+| `free_protected_bulk_async` | `(&mut self, Vec<ProtectedPageId<PAGE_SIZE>>) -> Result<()>` | Async version of `free_protected_bulk` (requires "async" feature) |
 | `page_size` | `(&self) -> usize` | Page size in bytes (always equal to `PAGE_SIZE`) |
 | `page_count` | `(&self) -> u64` | Total pages in the file, including reserved pages 0–2 |
 | `free_page_count` | `(&self) -> u64` | Pages currently available for allocation |
 
 ### `AllocatedPageIter<'_, PAGE_SIZE>`
 
-An iterator over allocated data pages, yielded by `Pager::iter_allocated_pages`.  Implements `Iterator<Item = PageId<PAGE_SIZE>>`.  Reserved pages 0–2 are never yielded.  Holds an immutable borrow on the `Pager` for its lifetime.
+An iterator over allocated regular data pages, yielded by `Pager::iter_allocated_pages`.  Implements `Iterator<Item = PageId<PAGE_SIZE>>`.  Reserved pages 0–2 and all internal protected-page resources (directory block pages and backing pages for in-use protected entries) are never yielded.  Holds an immutable borrow on the `Pager` for its lifetime.
+
+### `AllocatedProtectedPageIter<'_, PAGE_SIZE>`
+
+An iterator over in-use protected pages, yielded by `Pager::iter_allocated_protected_pages`.  Implements `Iterator<Item = ProtectedPageId<PAGE_SIZE>>`.  Regular data pages and internal directory-block pages are never included.  Holds an immutable borrow on the `Pager` for its lifetime.
 
 ### `PageId<PAGE_SIZE>`
 

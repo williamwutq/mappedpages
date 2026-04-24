@@ -667,6 +667,28 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
+    /// Returns `true` if `id` is a physical page managed internally by the
+    /// protected-page subsystem (a directory block page or a backing page for
+    /// an in-use protected entry).
+    ///
+    /// Used by [`AllocatedPageIter`] to exclude these pages from the regular
+    /// data-page iterator.
+    fn is_internal_page(&self, id: u64) -> bool {
+        for block in &self.dir_blocks {
+            if block.page_a == id || block.page_b == id {
+                return true;
+            }
+        }
+        for dir_page in &self.dir_pages {
+            for entry in &dir_page.entries {
+                if entry.in_use && (entry.page_a == id || entry.page_b == id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn mmap(&self) -> Result<&MmapMut, MappedPageError> {
         self.mmap.as_ref().ok_or(MappedPageError::Unavailable)
     }
@@ -918,12 +940,160 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
         self.commit_async().await
     }
 
+    // ── Protected-page bulk operations ────────────────────────────────────────
+
+    /// Allocate `count` protected (crash-consistent copy-on-write) pages.
+    ///
+    /// Each protected-page allocation involves multiple physical pages and
+    /// directory commits, so unlike [`alloc_bulk`](Self::alloc_bulk) this
+    /// method cannot batch everything into a single commit.  It does guarantee
+    /// atomicity in the failure case: if any allocation fails, all
+    /// already-allocated protected pages are freed before the error is
+    /// returned.
+    ///
+    /// Returns an empty `Vec` when `count` is zero.
+    pub fn alloc_protected_bulk(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<ProtectedPageId<PAGE_SIZE>>, MappedPageError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.alloc_protected() {
+                Ok(id) => ids.push(id),
+                Err(e) => {
+                    // Best-effort rollback of the already-allocated pages.
+                    for id in ids {
+                        let _ = self.free_protected(id);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Free multiple protected pages.
+    ///
+    /// All ids are validated before any page is freed: if any id is out of
+    /// bounds, not currently allocated, or duplicated, the method returns an
+    /// error and no pages are freed.  Each free still performs its own
+    /// directory commit, so unlike [`free_bulk`](Self::free_bulk) this method
+    /// does not batch everything into a single commit.
+    ///
+    /// Returns `Ok(())` immediately when `ids` is empty.
+    pub fn free_protected_bulk(
+        &mut self,
+        ids: Vec<ProtectedPageId<PAGE_SIZE>>,
+    ) -> Result<(), MappedPageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // Sort to detect duplicates cheaply via adjacent windows.
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        for window in sorted.windows(2) {
+            if window[0] == window[1] {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        // Validate every id before freeing any.
+        let epp = dir_entries_per_page(PAGE_SIZE);
+        for id in &sorted {
+            let block_idx = id.0 as usize / epp;
+            let slot = id.0 as usize % epp;
+            let entry = self
+                .dir_pages
+                .get(block_idx)
+                .and_then(|dp| dp.entries.get(slot))
+                .ok_or(MappedPageError::OutOfBounds)?;
+            if !entry.in_use {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        // All ids are valid; free each one.
+        for id in sorted {
+            self.free_protected(id)?;
+        }
+        Ok(())
+    }
+
+    /// Asynchronously allocate `count` protected pages.
+    ///
+    /// This is the async version of [`alloc_protected_bulk`](Self::alloc_protected_bulk).
+    #[cfg(feature = "async")]
+    pub async fn alloc_protected_bulk_async(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<ProtectedPageId<PAGE_SIZE>>, MappedPageError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            match self.alloc_protected_async().await {
+                Ok(id) => ids.push(id),
+                Err(e) => {
+                    for id in ids {
+                        let _ = self.free_protected_async(id).await;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Asynchronously free multiple protected pages.
+    ///
+    /// This is the async version of [`free_protected_bulk`](Self::free_protected_bulk).
+    #[cfg(feature = "async")]
+    pub async fn free_protected_bulk_async(
+        &mut self,
+        ids: Vec<ProtectedPageId<PAGE_SIZE>>,
+    ) -> Result<(), MappedPageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        for window in sorted.windows(2) {
+            if window[0] == window[1] {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        let epp = dir_entries_per_page(PAGE_SIZE);
+        for id in &sorted {
+            let block_idx = id.0 as usize / epp;
+            let slot = id.0 as usize % epp;
+            let entry = self
+                .dir_pages
+                .get(block_idx)
+                .and_then(|dp| dp.entries.get(slot))
+                .ok_or(MappedPageError::OutOfBounds)?;
+            if !entry.in_use {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        for id in sorted {
+            self.free_protected_async(id).await?;
+        }
+        Ok(())
+    }
+
     // ── Page iteration ────────────────────────────────────────────────────────
 
-    /// Return an iterator over all currently allocated data pages.
+    /// Return an iterator over all currently allocated regular data pages.
     ///
     /// Traverses the allocation bitmap and yields a [`PageId`] for every page
-    /// that is marked as allocated.  Reserved pages 0–2 are never included.
+    /// that is marked as allocated and is not an internal protected-page
+    /// resource (directory block pages and backing pages for in-use protected
+    /// entries are excluded).  Reserved pages 0–2 are never included.
+    ///
+    /// To iterate over allocated *protected* pages use
+    /// [`iter_allocated_protected_pages`](Self::iter_allocated_protected_pages).
     ///
     /// The iterator borrows the pager immutably, so no allocation or
     /// deallocation can occur while it is alive.
@@ -931,6 +1101,25 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
         AllocatedPageIter {
             pager: self,
             current: FIRST_DATA_PAGE,
+        }
+    }
+
+    /// Return an iterator over all currently allocated protected pages.
+    ///
+    /// Traverses the protected-page directory and yields a [`ProtectedPageId`]
+    /// for every slot that is currently in use.  Regular data pages are never
+    /// included.
+    ///
+    /// To iterate over allocated *regular* pages use
+    /// [`iter_allocated_pages`](Self::iter_allocated_pages).
+    ///
+    /// The iterator borrows the pager immutably, so no allocation or
+    /// deallocation can occur while it is alive.
+    pub fn iter_allocated_protected_pages(&self) -> AllocatedProtectedPageIter<'_, PAGE_SIZE> {
+        AllocatedProtectedPageIter {
+            pager: self,
+            block_idx: 0,
+            slot_idx: 0,
         }
     }
 
@@ -991,10 +1180,47 @@ impl<'a, const PAGE_SIZE: usize> Iterator for AllocatedPageIter<'a, PAGE_SIZE> {
             self.current += 1;
             let byte_idx = (id / 8) as usize;
             let bit = (id % 8) as u8;
-            if self.pager.meta.bitmap[byte_idx] & (1 << bit) != 0 {
+            if self.pager.meta.bitmap[byte_idx] & (1 << bit) != 0
+                && !self.pager.is_internal_page(id)
+            {
                 return Some(PageId(id));
             }
         }
         None
+    }
+}
+
+// ── AllocatedProtectedPageIter ────────────────────────────────────────────────
+
+/// An iterator over all currently allocated protected pages in a [`Pager`].
+///
+/// Yielded by [`Pager::iter_allocated_protected_pages`].  Regular data pages
+/// and internal directory-block pages are never included.  The iterator
+/// borrows the pager immutably for its lifetime.
+pub struct AllocatedProtectedPageIter<'a, const PAGE_SIZE: usize> {
+    pager: &'a Pager<PAGE_SIZE>,
+    block_idx: usize,
+    slot_idx: usize,
+}
+
+impl<'a, const PAGE_SIZE: usize> Iterator for AllocatedProtectedPageIter<'a, PAGE_SIZE> {
+    type Item = ProtectedPageId<PAGE_SIZE>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let epp = dir_entries_per_page(PAGE_SIZE);
+        loop {
+            let dir_page = self.pager.dir_pages.get(self.block_idx)?;
+            if self.slot_idx >= dir_page.entries.len() {
+                self.block_idx += 1;
+                self.slot_idx = 0;
+                continue;
+            }
+            let entry = &dir_page.entries[self.slot_idx];
+            let id = ProtectedPageId((self.block_idx * epp + self.slot_idx) as u64);
+            self.slot_idx += 1;
+            if entry.in_use {
+                return Some(id);
+            }
+        }
     }
 }
