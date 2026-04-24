@@ -16,9 +16,9 @@ A crash-consistent, memory-mapped, file-backed fixed-size page provider for Rust
 - **Borrow-checked safety** — `&MappedPage` and `&mut MappedPage` hold a borrow on the `Pager` that produced them. `alloc` and `free` both require `&mut Pager`, so the borrow checker statically prevents accessing a page reference after a remap — a compile error, not a runtime hazard.
 - **Dynamic growth** — the file grows automatically when space is exhausted, with safe recovery if a remap fails mid-grow.
 - **CRC32 checksums** — every metadata page and directory block is protected by a CRC32 checksum.  On open, the library validates both copies and falls back to the alternate if one is corrupt.
-- **Sub-page allocation** — `SubPageAllocator` divides big pages into smaller uniform sub-pages, so callers don't have to implement their own bitmap-based slab allocators on top of the raw pages.
+- **Sub-page allocation** — `SubPageAllocator` divides big pages into smaller uniform sub-pages, so callers don't have to implement their own bitmap-based slab allocators on top of the raw pages.  Implements `BulkPageAllocator` for sub-pages, so `alloc_bulk` and `free_bulk` work there too.
 - **Async I/O support** — async versions of allocation and deallocation methods are available with the "async" feature flag, enabling integration with async runtimes like Tokio.
-- **Bulk operations** — `alloc_bulk(count)` and `free_bulk(ids)` allocate or free multiple regular pages in a single crash-safe metadata commit. `alloc_protected_bulk` and `free_protected_bulk` provide the same convenience for protected pages. Both `free_bulk` variants validate all ids atomically so no partial state change occurs on error.
+- **Bulk operations** — `alloc_bulk(count)` and `free_bulk(ids)` allocate or free multiple regular pages in a single crash-safe metadata commit. `alloc_protected_bulk` and `free_protected_bulk` provide the same convenience for protected pages. `SubPageAllocator` also supports `alloc_bulk`/`free_bulk`. All `free_bulk` variants validate all ids atomically so no partial state change occurs on error. The `BulkPageAllocator` trait lets generic code require this capability with a single where-bound.
 - **Page iterators** — `iter_allocated_pages()` returns an `AllocatedPageIter` over regular data pages (internal protected-page resources are excluded). `iter_allocated_protected_pages()` returns an `AllocatedProtectedPageIter` over in-use protected pages. The two iterators are strictly disjoint: neither leaks the other's pages.
 
 ## File layout
@@ -113,9 +113,9 @@ let id: ProtectedPageId<4096> = pager.alloc_protected()?;
 }
 ```
 
-### `PageAllocator` trait
+### `PageAllocator` and `BulkPageAllocator` traits
 
-Both `PageId` and `ProtectedPageId` implement the `PageHandle<Pager<N>>` trait, and `Pager<N>` implements `PageAllocator` for both.  This allows generic code to work with either page type:
+`PageId`, `ProtectedPageId`, and `SubPageId` all implement `PageHandle` for their respective allocator types.  `Pager<N>` implements `PageAllocator` for both `PageId` and `ProtectedPageId`; `SubPageAllocator` implements it for `SubPageId`.  This allows generic code to work with any page type:
 
 ```rust
 use mappedpages::{PageAllocator, PageHandle, Pager, PageId};
@@ -129,11 +129,25 @@ where
 }
 ```
 
+`BulkPageAllocator<H>` is a supertrait of `PageAllocator<H>` for allocators that support efficient or all-or-nothing batch operations.  It is implemented by `Pager<N>` for both `PageId` and `ProtectedPageId`, and by `SubPageAllocator` for `SubPageId`.  Requiring it is as simple as adding a bound:
+
+```rust
+use mappedpages::{BulkPageAllocator, PageHandle};
+
+fn load_bulk<A, H>(allocator: &mut A, n: usize) -> Vec<H>
+where
+    H: PageHandle<A>,
+    A: BulkPageAllocator<H>,
+{
+    allocator.alloc_bulk(n).unwrap()
+}
+```
+
 ### Sub-page allocation
 
 The file format always uses a single fixed page size — the size is written to the superblock on `create` and checked on every `open`.  When your workload needs smaller granularity than the on-disk page size, `SubPageAllocator` handles the bookkeeping for you so you don't have to build your own bitmap-based slab allocator on top of raw pages.
 
-`SubPageAllocator<PARENT_SIZE, SUB_SIZE>` wraps a `Pager<PARENT_SIZE>`, divides each big page it checks out into `PARENT_SIZE / SUB_SIZE` sub-slots, and exposes them as `SubPageId` handles that plug into the same `PageHandle` / `PageAllocator` traits.  Up to 64 sub-pages per big page are supported.
+`SubPageAllocator<PARENT_SIZE, SUB_SIZE>` wraps a `Pager<PARENT_SIZE>`, divides each big page it checks out into `PARENT_SIZE / SUB_SIZE` sub-slots, and exposes them as `SubPageId` handles that plug into the same `PageHandle` / `PageAllocator` traits.  It also implements `BulkPageAllocator`, so `alloc_bulk` and `free_bulk` are available for sub-pages with the same all-or-nothing validation semantics.  Up to 64 sub-pages per big page are supported.
 
 **Important:** sub-allocation state is in-memory only.  The on-disk file is unchanged — sub-slots live inside the data bytes of normal pages — but the free/used bitmasks are not written to disk.  On process restart, reconstruct your sub-allocation state from your own records before using sub-page handles again.
 
@@ -347,6 +361,8 @@ Compile-time constraints: `SUB_SIZE` must be a power of two, `PARENT_SIZE` must 
 | `new` | `(Pager<PARENT_SIZE>) -> Self` | Wrap a pager; no big pages are checked out until the first `alloc` |
 | `alloc` | `(&mut self) -> Result<SubPageId<PARENT_SIZE, SUB_SIZE>>` | Allocate one sub-page; checks out a new big page from the inner pager when needed |
 | `free` | `(&mut self, SubPageId<...>) -> Result<()>` | Free a sub-page; returns the big page to the inner pager when all its sub-slots are free |
+| `alloc_bulk` | `(&mut self, usize) -> Result<Vec<SubPageId<...>>>` | Allocate `n` sub-pages; rolls back already-allocated sub-pages on failure |
+| `free_bulk` | `(&mut self, Vec<SubPageId<...>>) -> Result<()>` | Free multiple sub-pages; validates all ids atomically, releases any fully-freed big pages |
 | `pager` | `(&self) -> &Pager<PARENT_SIZE>` | Borrow the inner pager (e.g. to query `page_count`) |
 | `into_pager` | `(self) -> Pager<PARENT_SIZE>` | Consume this allocator and recover the inner pager |
 
@@ -359,9 +375,9 @@ Opaque handle to one allocated sub-page.  Cheap to copy.  Can only be used with 
 | `get`     | `(&self, &'a SubPageAllocator<...>) -> Result<&'a MappedPage>`         | Immutably borrow the sub-page (`len()` == `SUB_SIZE`) |
 | `get_mut` | `(&self, &'a mut SubPageAllocator<...>) -> Result<&'a mut MappedPage>` | Mutably borrow the sub-page |
 
-### `PageAllocator` / `PageHandle` traits
+### `PageAllocator` / `BulkPageAllocator` / `PageHandle` traits
 
-`PageHandle<A>` is implemented by `PageId<N>`, `ProtectedPageId<N>`, and `SubPageId<P, S>` for their respective allocator types.  `PageAllocator<H>` is implemented by `Pager<N>` for the first two and by `SubPageAllocator<P, S>` for the third, enabling generic allocator code across all three page types.
+`PageHandle<A>` is implemented by `PageId<N>`, `ProtectedPageId<N>`, and `SubPageId<P, S>` for their respective allocator types.  `PageAllocator<H>` is implemented by `Pager<N>` for the first two and by `SubPageAllocator<P, S>` for the third.  `BulkPageAllocator<H>` is an optional supertrait of `PageAllocator<H>` that adds `alloc_bulk` and `free_bulk`; it is implemented by `Pager<N>` for both `PageId` and `ProtectedPageId`, and by `SubPageAllocator<P, S>` for `SubPageId`.  Generic code that requires bulk capability adds a `where A: BulkPageAllocator<H>` bound.
 
 ## Error handling
 

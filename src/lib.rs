@@ -78,13 +78,30 @@
 //! each one into `PARENT_SIZE / SUB_SIZE` sub-slots (up to 64).  Handles are
 //! [`SubPageId<PARENT_SIZE, SUB_SIZE>`](SubPageId), which implement
 //! [`PageHandle`] and [`PageAllocator`] just like [`PageId`] and
-//! [`ProtectedPageId`].
+//! [`ProtectedPageId`].  It also implements [`BulkPageAllocator`], so
+//! `alloc_bulk` and `free_bulk` are available for sub-pages with the same
+//! all-or-nothing validation semantics.
 //!
 //! **Sub-allocation state is in-memory only.**  The on-disk file is unchanged —
 //! sub-slots live inside the data bytes of ordinary pages, and the free/used
 //! bitmasks are never written to disk.  On process restart, callers must
 //! reconstruct which sub-slots are in use from their own records before
 //! issuing sub-page handles again.
+//!
+//! # Allocator traits
+//!
+//! [`PageHandle<A>`](PageHandle) is implemented by [`PageId`],
+//! [`ProtectedPageId`], and [`SubPageId`] for their respective allocator
+//! types.  [`PageAllocator<H>`](PageAllocator) is the single-page interface;
+//! it is implemented by [`Pager`] for both `PageId` and `ProtectedPageId` and
+//! by [`SubPageAllocator`] for `SubPageId`.
+//!
+//! [`BulkPageAllocator<H>`](BulkPageAllocator) is an optional supertrait of
+//! [`PageAllocator`] for allocators that can allocate or free multiple handles
+//! efficiently, or need all-or-nothing validation semantics across a batch.
+//! It is implemented by [`Pager`] for both `PageId` and `ProtectedPageId`, and
+//! by [`SubPageAllocator`] for `SubPageId`.  Generic code can require bulk
+//! capability with a `where A: BulkPageAllocator<H>` bound.
 //!
 //! # Reference lifetime and grow safety
 //!
