@@ -13,18 +13,7 @@ Implement optional page-level compression to reduce storage footprint:
 
 This would be especially useful for workloads with compressible data patterns, reducing both storage costs and I/O bandwidth.
 
-## 2. Bulk Operations API
-
-Add methods for efficient bulk allocation and deallocation:
-
-```rust
-fn alloc_bulk(&mut self, count: usize) -> Result<Vec<PageId<PAGE_SIZE>>, MappedPageError>
-fn free_bulk(&mut self, ids: Vec<PageId<PAGE_SIZE>>) -> Result<(), MappedPageError>
-```
-
-This would reduce the overhead of individual allocation calls and provide better performance for applications that need to allocate many pages at once.
-
-## 3. Read-Only Pager Mode
+## 2. Read-Only Pager Mode
 
 Add a `ReadOnlyPager` variant that can open files without write access:
 
@@ -34,18 +23,7 @@ Add a `ReadOnlyPager` variant that can open files without write access:
 
 This would allow safe concurrent read access from multiple processes.
 
-## 4. Page Iterator
-
-Implement iterators to traverse allocated pages:
-
-```rust
-fn iter_allocated_pages(&self) -> impl Iterator<Item = PageId<PAGE_SIZE>>
-fn iter_allocated_pages_mut(&mut self) -> impl Iterator<Item = &mut PageId<PAGE_SIZE>>
-```
-
-This would enable efficient traversal of all allocated pages for maintenance, backup, or analysis operations.
-
-## 5. Page Defragmentation
+## 3. Page Defragmentation
 
 Add compaction functionality to reorganize pages and reclaim space:
 
@@ -56,7 +34,7 @@ Add compaction functionality to reorganize pages and reclaim space:
 
 This would help maintain optimal file layout over time as pages are allocated and freed.
 
-## 6. Backup and Snapshot Support
+## 4. Backup and Snapshot Support
     
 Implement utilities for creating point-in-time snapshots:
 
@@ -67,7 +45,7 @@ Implement utilities for creating point-in-time snapshots:
 
 This would enable robust backup strategies and point-in-time recovery.
 
-## 7. Custom Allocation Strategies
+## 5. Custom Allocation Strategies
 
 Make the allocation algorithm pluggable:
 
@@ -86,7 +64,7 @@ Allow users to implement different strategies like:
 
 This would allow optimization for specific workload patterns.
 
-## 8. Concurrent Access Patterns
+## 6. Concurrent Access Patterns
 
 Add support for concurrent access while maintaining safety:
 

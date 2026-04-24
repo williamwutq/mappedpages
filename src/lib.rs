@@ -85,6 +85,6 @@ mod tests;
 pub use allocator::{PageAllocator, PageHandle};
 pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
-pub use pager::Pager;
+pub use pager::{AllocatedPageIter, Pager};
 pub use protected::{ProtectedPageId, ProtectedPageWriter};
 pub use sub_allocator::{SubPageAllocator, SubPageId};

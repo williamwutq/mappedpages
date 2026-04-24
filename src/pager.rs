@@ -799,6 +799,141 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
         Ok(())
     }
 
+    // ── Bulk operations ───────────────────────────────────────────────────────
+
+    /// Allocate `count` pages in a single crash-safe commit.
+    ///
+    /// Equivalent to calling [`alloc`](Self::alloc) `count` times but with only
+    /// one metadata commit at the end, making it more efficient for bulk
+    /// allocations.  The file grows as needed.  On error no pages are allocated
+    /// and no commit is performed.
+    ///
+    /// Returns an empty `Vec` when `count` is zero.
+    pub fn alloc_bulk(&mut self, count: usize) -> Result<Vec<PageId<PAGE_SIZE>>, MappedPageError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(PageId(self.alloc_one_raw()?));
+        }
+        self.commit()?;
+        Ok(ids)
+    }
+
+    /// Free multiple pages in a single crash-safe commit.
+    ///
+    /// Equivalent to calling [`free`](Self::free) for each id but with only one
+    /// metadata commit at the end.  All ids are validated before any state is
+    /// modified: if any id is reserved, out of bounds, already free, or
+    /// duplicated the method returns an error and no pages are freed.
+    ///
+    /// Returns `Ok(())` immediately when `ids` is empty.
+    pub fn free_bulk(&mut self, ids: Vec<PageId<PAGE_SIZE>>) -> Result<(), MappedPageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // Sort to detect duplicates cheaply via adjacent windows.
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        for window in sorted.windows(2) {
+            if window[0] == window[1] {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        // Validate every id before touching the bitmap.
+        for id in &sorted {
+            if id.0 < FIRST_DATA_PAGE {
+                return Err(MappedPageError::ReservedPage);
+            }
+            if id.0 >= self.meta.total_pages {
+                return Err(MappedPageError::OutOfBounds);
+            }
+            let byte_idx = (id.0 / 8) as usize;
+            let bit = (id.0 % 8) as u8;
+            if self.meta.bitmap[byte_idx] & (1 << bit) == 0 {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        // All ids are valid; free them and commit once.
+        for id in sorted {
+            self.meta.free_page(id.0);
+        }
+        self.commit()
+    }
+
+    /// Asynchronously allocate `count` pages in a single crash-safe commit.
+    ///
+    /// This is the async version of [`alloc_bulk`](Self::alloc_bulk).
+    #[cfg(feature = "async")]
+    pub async fn alloc_bulk_async(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<PageId<PAGE_SIZE>>, MappedPageError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push(PageId(self.alloc_one_raw()?));
+        }
+        self.commit_async().await?;
+        Ok(ids)
+    }
+
+    /// Asynchronously free multiple pages in a single crash-safe commit.
+    ///
+    /// This is the async version of [`free_bulk`](Self::free_bulk).
+    #[cfg(feature = "async")]
+    pub async fn free_bulk_async(
+        &mut self,
+        ids: Vec<PageId<PAGE_SIZE>>,
+    ) -> Result<(), MappedPageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        for window in sorted.windows(2) {
+            if window[0] == window[1] {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        for id in &sorted {
+            if id.0 < FIRST_DATA_PAGE {
+                return Err(MappedPageError::ReservedPage);
+            }
+            if id.0 >= self.meta.total_pages {
+                return Err(MappedPageError::OutOfBounds);
+            }
+            let byte_idx = (id.0 / 8) as usize;
+            let bit = (id.0 % 8) as u8;
+            if self.meta.bitmap[byte_idx] & (1 << bit) == 0 {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+        for id in sorted {
+            self.meta.free_page(id.0);
+        }
+        self.commit_async().await
+    }
+
+    // ── Page iteration ────────────────────────────────────────────────────────
+
+    /// Return an iterator over all currently allocated data pages.
+    ///
+    /// Traverses the allocation bitmap and yields a [`PageId`] for every page
+    /// that is marked as allocated.  Reserved pages 0–2 are never included.
+    ///
+    /// The iterator borrows the pager immutably, so no allocation or
+    /// deallocation can occur while it is alive.
+    pub fn iter_allocated_pages(&self) -> AllocatedPageIter<'_, PAGE_SIZE> {
+        AllocatedPageIter {
+            pager: self,
+            current: FIRST_DATA_PAGE,
+        }
+    }
+
     /// Extend the file to twice its current page count and remap.
     ///
     /// Does not commit; the caller (`alloc`) allocates a page and commits once.
@@ -832,5 +967,34 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
                 Err(MappedPageError::Io(e))
             }
         }
+    }
+}
+
+// ── AllocatedPageIter ─────────────────────────────────────────────────────────
+
+/// An iterator over all currently allocated data pages in a [`Pager`].
+///
+/// Yielded by [`Pager::iter_allocated_pages`].  Reserved pages 0–2 are never
+/// included.  The iterator borrows the pager immutably for its lifetime.
+pub struct AllocatedPageIter<'a, const PAGE_SIZE: usize> {
+    pager: &'a Pager<PAGE_SIZE>,
+    /// Next page index to examine.
+    current: u64,
+}
+
+impl<'a, const PAGE_SIZE: usize> Iterator for AllocatedPageIter<'a, PAGE_SIZE> {
+    type Item = PageId<PAGE_SIZE>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.current < self.pager.meta.total_pages {
+            let id = self.current;
+            self.current += 1;
+            let byte_idx = (id / 8) as usize;
+            let bit = (id % 8) as u8;
+            if self.pager.meta.bitmap[byte_idx] & (1 << bit) != 0 {
+                return Some(PageId(id));
+            }
+        }
+        None
     }
 }

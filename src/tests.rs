@@ -1468,3 +1468,234 @@ fn sub_alloc_n_equals_64() {
         sub.free(id).unwrap();
     }
 }
+
+// ── alloc_bulk / free_bulk tests ──────────────────────────────────────────────
+
+#[test]
+fn bulk_alloc_zero_returns_empty() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(0).unwrap();
+    assert!(ids.is_empty());
+}
+
+#[test]
+fn bulk_alloc_returns_distinct_ids() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(3).unwrap();
+    assert_eq!(ids.len(), 3);
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 3, "all ids must be distinct");
+    for id in &ids {
+        assert!(id.0 >= FIRST_DATA_PAGE);
+    }
+}
+
+#[test]
+fn bulk_alloc_all_data_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    // Initial file: 4 pages total, 1 free data page (page 3).
+    let ids = pager.alloc_bulk(1).unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids[0].0, FIRST_DATA_PAGE);
+}
+
+#[test]
+fn bulk_alloc_triggers_grow() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    // Exhaust the initial free page, then allocate 5 more (forces grow).
+    let ids = pager.alloc_bulk(6).unwrap();
+    assert_eq!(ids.len(), 6);
+}
+
+#[test]
+fn bulk_alloc_persists_across_reopen() {
+    let tmp = TempPath::new();
+    let ids = {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        pager.alloc_bulk(3).unwrap()
+    };
+    let pager = Pager::<4096>::open(tmp.path()).unwrap();
+    assert_eq!(
+        pager.free_page_count() + 3,
+        pager.page_count() - FIRST_DATA_PAGE
+    );
+    // All allocated ids should be accessible.
+    for id in &ids {
+        assert!(id.get(&pager).is_ok());
+    }
+}
+
+#[test]
+fn bulk_free_zero_is_ok() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    assert!(pager.free_bulk(vec![]).is_ok());
+}
+
+#[test]
+fn bulk_free_releases_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(3).unwrap();
+    let free_before = pager.free_page_count();
+    pager.free_bulk(ids).unwrap();
+    assert_eq!(pager.free_page_count(), free_before + 3);
+}
+
+#[test]
+fn bulk_free_reserved_page_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let result = pager.free_bulk(vec![PageId(0)]);
+    assert!(matches!(result, Err(MappedPageError::ReservedPage)));
+}
+
+#[test]
+fn bulk_free_out_of_bounds_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let result = pager.free_bulk(vec![PageId(9999)]);
+    assert!(matches!(result, Err(MappedPageError::OutOfBounds)));
+}
+
+#[test]
+fn bulk_free_double_free_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(2).unwrap();
+    pager.free_bulk(ids.clone()).unwrap();
+    // Freeing the same pages again should fail.
+    let result = pager.free_bulk(ids);
+    assert!(matches!(result, Err(MappedPageError::DoubleFree)));
+}
+
+#[test]
+fn bulk_free_duplicate_in_input_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(1).unwrap();
+    // Pass the same PageId twice.
+    let result = pager.free_bulk(vec![ids[0], ids[0]]);
+    assert!(matches!(result, Err(MappedPageError::DoubleFree)));
+    // The page must still be allocated (no partial state change).
+    assert!(ids[0].get(&pager).is_ok());
+}
+
+#[test]
+fn bulk_free_atomic_no_partial_free_on_error() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(2).unwrap();
+    let free_before = pager.free_page_count();
+    // Mix a valid id with an out-of-bounds one.
+    let result = pager.free_bulk(vec![ids[0], PageId(9999)]);
+    assert!(result.is_err());
+    // No pages should have been freed.
+    assert_eq!(pager.free_page_count(), free_before);
+}
+
+#[test]
+fn bulk_free_persists_across_reopen() {
+    let tmp = TempPath::new();
+    let ids = {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        let ids = pager.alloc_bulk(3).unwrap();
+        pager.free_bulk(ids.clone()).unwrap();
+        ids
+    };
+    let pager = Pager::<4096>::open(tmp.path()).unwrap();
+    // Freed pages should be available again; trying to get them should fail as unallocated
+    // (they're free so get_page would succeed if bounds are ok — verify free_count instead).
+    assert_eq!(
+        pager.free_page_count(),
+        pager.page_count() - FIRST_DATA_PAGE,
+        "all data pages should be free after reopen"
+    );
+    drop(ids);
+}
+
+// ── iter_allocated_pages tests ────────────────────────────────────────────────
+
+#[test]
+fn iter_empty_pager_yields_nothing() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let allocated: Vec<_> = pager.iter_allocated_pages().collect();
+    assert!(allocated.is_empty());
+}
+
+#[test]
+fn iter_yields_allocated_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(3).unwrap();
+    let mut iterated: Vec<_> = pager.iter_allocated_pages().collect();
+    iterated.sort_unstable();
+    let mut expected = ids.clone();
+    expected.sort_unstable();
+    assert_eq!(iterated, expected);
+}
+
+#[test]
+fn iter_excludes_freed_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(3).unwrap();
+    pager.free(ids[1]).unwrap();
+    let iterated: Vec<_> = pager.iter_allocated_pages().collect();
+    assert_eq!(iterated.len(), 2);
+    assert!(!iterated.contains(&ids[1]));
+}
+
+#[test]
+fn iter_excludes_reserved_pages() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    pager.alloc_bulk(2).unwrap();
+    for id in pager.iter_allocated_pages() {
+        assert!(
+            id.0 >= FIRST_DATA_PAGE,
+            "reserved page leaked through iterator"
+        );
+    }
+}
+
+#[test]
+fn iter_count_matches_alloc_count() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    pager.alloc_bulk(5).unwrap();
+    let count = pager.iter_allocated_pages().count();
+    assert_eq!(count, 5);
+}
+
+#[test]
+fn iter_after_free_bulk_is_empty() {
+    let tmp = TempPath::new();
+    let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let ids = pager.alloc_bulk(4).unwrap();
+    pager.free_bulk(ids).unwrap();
+    let iterated: Vec<_> = pager.iter_allocated_pages().collect();
+    assert!(iterated.is_empty());
+}
+
+#[test]
+fn iter_survives_reopen() {
+    let tmp = TempPath::new();
+    let ids = {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        pager.alloc_bulk(3).unwrap()
+    };
+    let pager = Pager::<4096>::open(tmp.path()).unwrap();
+    let mut iterated: Vec<_> = pager.iter_allocated_pages().collect();
+    iterated.sort_unstable();
+    let mut expected = ids.clone();
+    expected.sort_unstable();
+    assert_eq!(iterated, expected);
+}
