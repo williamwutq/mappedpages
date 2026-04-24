@@ -1337,7 +1337,7 @@ fn crash_old_file_without_dir_section_opens_cleanly() {
 
 // ── SubPageAllocator tests ────────────────────────────────────────────────────
 
-use crate::{PageAllocator, PageHandle, SubPageAllocator, SubPageId};
+use crate::{BulkPageAllocator, PageAllocator, PageHandle, SubPageAllocator, SubPageId};
 
 #[test]
 fn sub_alloc_basic_alloc_get_free() {
@@ -1467,6 +1467,132 @@ fn sub_alloc_n_equals_64() {
     for id in ids {
         sub.free(id).unwrap();
     }
+}
+
+// ── SubPageAllocator bulk tests ───────────────────────────────────────────────
+
+#[test]
+fn sub_bulk_alloc_zero_returns_empty() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let ids = sub.alloc_bulk(0).unwrap();
+    assert!(ids.is_empty());
+}
+
+#[test]
+fn sub_bulk_alloc_returns_distinct_ids() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let ids = sub.alloc_bulk(5).unwrap();
+    assert_eq!(ids.len(), 5);
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 5, "all ids must be distinct");
+    for id in ids {
+        sub.free(id).unwrap();
+    }
+}
+
+#[test]
+fn sub_bulk_alloc_spans_multiple_big_pages() {
+    // 4096 / 512 = 8 sub-slots per big page; alloc 10 forces a second big page.
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let ids = sub.alloc_bulk(10).unwrap();
+    assert_eq!(ids.len(), 10);
+    // At least two distinct slot_index values required.
+    let distinct_slots: std::collections::HashSet<_> = ids.iter().map(|id| id.slot_index).collect();
+    assert!(distinct_slots.len() >= 2);
+    for id in ids {
+        sub.free(id).unwrap();
+    }
+}
+
+#[test]
+fn sub_bulk_free_zero_is_ok() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    assert!(sub.free_bulk(vec![]).is_ok());
+}
+
+#[test]
+fn sub_bulk_free_releases_pages() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let ids = sub.alloc_bulk(4).unwrap();
+    sub.free_bulk(ids).unwrap();
+    // After freeing all sub-slots the big page should have been returned;
+    // reallocating should succeed and reuse the same slot.
+    let id2 = sub.alloc().unwrap();
+    assert_eq!(id2.slot_index, 0);
+}
+
+#[test]
+fn sub_bulk_free_releases_big_page_when_all_sub_slots_freed() {
+    // Alloc exactly one full big page worth of sub-slots (8 for 4096/512).
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let initial_free = sub.pager().free_page_count();
+    let ids = sub.alloc_bulk(8).unwrap();
+    assert_eq!(sub.pager().free_page_count(), initial_free - 1); // one big page consumed
+    sub.free_bulk(ids).unwrap();
+    assert_eq!(sub.pager().free_page_count(), initial_free); // big page returned
+}
+
+#[test]
+fn sub_bulk_free_double_free_error() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let id = sub.alloc().unwrap();
+    sub.free(id).unwrap();
+    let result = sub.free_bulk(vec![id]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn sub_bulk_free_duplicate_in_input_error() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let id = sub.alloc().unwrap();
+    let result = sub.free_bulk(vec![id, id]);
+    assert!(result.is_err());
+    sub.free(id).unwrap(); // original allocation still valid
+}
+
+#[test]
+fn sub_bulk_free_out_of_bounds_error() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let bad = SubPageId::<4096, 512>::new_raw(999, 0);
+    let result = sub.free_bulk(vec![bad]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn sub_bulk_free_atomic_no_partial_free_on_error() {
+    // Alloc two valid ids, then pass them alongside an invalid one.
+    // Both valid ids should still be live after the failed bulk free.
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let id0 = sub.alloc().unwrap();
+    let id1 = sub.alloc().unwrap();
+    let bad = SubPageId::<4096, 512>::new_raw(999, 0);
+    let result = sub.free_bulk(vec![id0, id1, bad]);
+    assert!(result.is_err());
+    // Both ids must still be individually freeable.
+    sub.free(id0).unwrap();
+    sub.free(id1).unwrap();
 }
 
 // ── alloc_bulk / free_bulk tests ──────────────────────────────────────────────

@@ -113,7 +113,7 @@ mod sub_allocator;
 #[cfg(test)]
 mod tests;
 
-pub use allocator::{PageAllocator, PageHandle};
+pub use allocator::{BulkPageAllocator, PageAllocator, PageHandle};
 pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
 pub use pager::{AllocatedPageIter, AllocatedProtectedPageIter, Pager};
