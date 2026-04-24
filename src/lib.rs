@@ -162,6 +162,7 @@ mod meta;
 mod page;
 mod pager;
 mod protected;
+mod readonly;
 mod sub_allocator;
 #[cfg(test)]
 mod tests;
@@ -172,4 +173,5 @@ pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
 pub use pager::{AllocatedPageIter, AllocatedProtectedPageIter, Pager};
 pub use protected::{ProtectedPageId, ProtectedPageWriter};
+pub use readonly::{ReadOnlyAllocatedPageIter, ReadOnlyAllocatedProtectedPageIter, ReadOnlyPager};
 pub use sub_allocator::{SubPageAllocator, SubPageId};

@@ -2240,3 +2240,127 @@ fn concurrent_protected_page_read_across_threads() {
 
     assert_eq!(byte, 55);
 }
+
+// ── ReadOnlyPager tests ───────────────────────────────────────────────────────
+
+#[test]
+fn readonly_open_sees_allocated_pages() {
+    use crate::ReadOnlyPager;
+
+    let tmp = TempPath::new();
+    let id = {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        let id = pager.alloc().unwrap();
+        pager.get_page_mut(id).unwrap().as_bytes_mut()[0] = 42;
+        id
+    };
+
+    let ro = ReadOnlyPager::<4096>::open(tmp.path()).unwrap();
+    assert_eq!(ro.page_count(), 4);
+    let pages: Vec<_> = ro.iter_allocated_pages().collect();
+    assert_eq!(pages, vec![id]);
+    assert_eq!(ro.get_page(id).unwrap().as_bytes()[0], 42);
+}
+
+#[test]
+fn readonly_wrong_page_size_is_rejected() {
+    use crate::ReadOnlyPager;
+
+    let tmp = TempPath::new();
+    Pager::<4096>::create(tmp.path()).unwrap();
+    assert!(matches!(
+        ReadOnlyPager::<1024>::open(tmp.path()),
+        Err(MappedPageError::InvalidPageSize)
+    ));
+}
+
+#[test]
+fn readonly_reserved_page_returns_error() {
+    use crate::ReadOnlyPager;
+
+    let tmp = TempPath::new();
+    Pager::<4096>::create(tmp.path()).unwrap();
+    let ro = ReadOnlyPager::<4096>::open(tmp.path()).unwrap();
+    assert!(matches!(
+        ro.get_page(PageId(0)),
+        Err(MappedPageError::ReservedPage)
+    ));
+    assert!(matches!(
+        ro.get_page(PageId(1)),
+        Err(MappedPageError::ReservedPage)
+    ));
+    assert!(matches!(
+        ro.get_page(PageId(2)),
+        Err(MappedPageError::ReservedPage)
+    ));
+}
+
+#[test]
+fn readonly_out_of_bounds_returns_error() {
+    use crate::ReadOnlyPager;
+
+    let tmp = TempPath::new();
+    Pager::<4096>::create(tmp.path()).unwrap();
+    let ro = ReadOnlyPager::<4096>::open(tmp.path()).unwrap();
+    assert!(matches!(
+        ro.get_page(PageId(999)),
+        Err(MappedPageError::OutOfBounds)
+    ));
+}
+
+#[test]
+fn readonly_sees_protected_pages() {
+    use crate::ReadOnlyPager;
+
+    let tmp = TempPath::new();
+    let pid = {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        let pid = pager.alloc_protected().unwrap();
+        let mut w = pid.get_mut(&mut pager).unwrap();
+        w.page_mut().as_bytes_mut()[0] = 99;
+        w.commit().unwrap();
+        pid
+    };
+
+    let ro = ReadOnlyPager::<4096>::open(tmp.path()).unwrap();
+    let protected: Vec<_> = ro.iter_allocated_protected_pages().collect();
+    assert_eq!(protected, vec![pid]);
+    assert_eq!(ro.get_protected_page(pid).unwrap().as_bytes()[0], 99);
+}
+
+#[test]
+fn readonly_iter_excludes_internal_pages() {
+    use crate::ReadOnlyPager;
+
+    let tmp = TempPath::new();
+    {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        pager.alloc_protected().unwrap();
+        pager.alloc().unwrap();
+    }
+
+    let ro = ReadOnlyPager::<4096>::open(tmp.path()).unwrap();
+    // iter_allocated_pages must yield only the regular data page, not the two
+    // protected backing pages or the two directory block pages.
+    assert_eq!(ro.iter_allocated_pages().count(), 1);
+    assert_eq!(ro.iter_allocated_protected_pages().count(), 1);
+}
+
+#[test]
+fn readonly_metadata_agrees_with_writer() {
+    use crate::ReadOnlyPager;
+
+    let tmp = TempPath::new();
+    {
+        let mut pager = Pager::<4096>::create(tmp.path()).unwrap();
+        pager.alloc().unwrap();
+        pager.alloc().unwrap();
+    }
+
+    let pager = Pager::<4096>::open(tmp.path()).unwrap();
+    let ro = ReadOnlyPager::<4096>::open(tmp.path()).unwrap();
+
+    assert_eq!(ro.page_count(), pager.page_count());
+    assert_eq!(ro.free_page_count(), pager.free_page_count());
+    assert_eq!(ro.page_size(), pager.page_size());
+}

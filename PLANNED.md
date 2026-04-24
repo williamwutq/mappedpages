@@ -2,17 +2,7 @@
 
 This document outlines planned enhancements to the `mappedpages` crate, a crash-consistent, memory-mapped, file-backed fixed-size page allocator.
 
-## 1. Read-Only Pager Mode
-
-Add a `ReadOnlyPager` variant that can open files without write access:
-
-- `ReadOnlyPager::<PAGE_SIZE>::open(path) -> Result<Self, MappedPageError>`
-- All write operations would be compile-time errors
-- Useful for read-heavy workloads, backup scenarios, and data analysis
-
-This would allow safe concurrent read access from multiple processes.
-
-## 2. Page Defragmentation
+## 1. Page Defragmentation
 
 Add compaction functionality to reorganize pages and reclaim space:
 
@@ -23,7 +13,7 @@ Add compaction functionality to reorganize pages and reclaim space:
 
 This would help maintain optimal file layout over time as pages are allocated and freed.
 
-## 3. Backup and Snapshot Support
+## 2. Backup and Snapshot Support
 
 Implement utilities for creating point-in-time snapshots:
 
