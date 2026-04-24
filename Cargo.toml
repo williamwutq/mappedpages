@@ -14,3 +14,7 @@ keywords = ["memory-mapping", "allocator", "storage", "pages", "fixed-size"]
 [dependencies]
 memmap2 = "0.9"
 crc32fast = "1"
+tokio = { version = "1", optional = true }
+
+[features]
+async = ["tokio"]

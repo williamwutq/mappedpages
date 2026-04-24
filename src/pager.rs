@@ -252,6 +252,52 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
         self.commit()
     }
 
+    // ── Async I/O Support ────────────────────────────────────────────────────
+
+    /// Asynchronously allocate a page.
+    ///
+    /// This is the async version of [`alloc`]. It performs the same operation
+    /// but allows the caller to await other tasks while I/O operations complete.
+    ///
+    /// Requires the "async" feature to be enabled.
+    #[cfg(feature = "async")]
+    pub async fn alloc_async(&mut self) -> Result<PageId<PAGE_SIZE>, MappedPageError> {
+        let id = self.alloc_one_raw()?;
+        self.commit_async().await?;
+        Ok(PageId(id))
+    }
+
+    /// Asynchronously mark `id` as free.
+    ///
+    /// This is the async version of [`free`]. It performs the same operation
+    /// but allows the caller to await other tasks while I/O operations complete.
+    ///
+    /// Requires the "async" feature to be enabled.
+    #[cfg(feature = "async")]
+    pub async fn free_async(&mut self, id: PageId<PAGE_SIZE>) -> Result<(), MappedPageError> {
+        if id.0 < FIRST_DATA_PAGE {
+            return Err(MappedPageError::ReservedPage);
+        }
+        if !self.meta.free_page(id.0) {
+            return Err(if id.0 >= self.meta.total_pages {
+                MappedPageError::OutOfBounds
+            } else {
+                MappedPageError::DoubleFree
+            });
+        }
+        self.commit_async().await
+    }
+
+    /// Asynchronously commit metadata changes to disk.
+    ///
+    /// This is the async version of the internal `commit` method.
+    /// Note: Currently blocks the async runtime thread due to mmap flush operations.
+    /// In future versions, this may be made truly async.
+    #[cfg(feature = "async")]
+    async fn commit_async(&mut self) -> Result<(), MappedPageError> {
+        self.commit()
+    }
+
     // ── Protected-page allocation ─────────────────────────────────────────────
 
     /// Allocate a protected (crash-consistent copy-on-write) page.
@@ -356,6 +402,117 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
         self.meta.free_page(pa);
         self.meta.free_page(pb);
         self.commit()
+    }
+
+    /// Asynchronously allocate a protected (crash-consistent copy-on-write) page.
+    ///
+    /// This is the async version of [`alloc_protected`].
+    #[cfg(feature = "async")]
+    pub async fn alloc_protected_async(
+        &mut self,
+    ) -> Result<ProtectedPageId<PAGE_SIZE>, MappedPageError> {
+        let epp = dir_entries_per_page(PAGE_SIZE);
+
+        // Try to claim a free slot in an existing directory block.
+        for block_idx in 0..self.dir_pages.len() {
+            if let Some(slot) = self.dir_pages[block_idx]
+                .entries
+                .iter()
+                .position(|e| !e.in_use)
+            {
+                // Allocate two backing pages and commit the normal metadata.
+                let pa = self.alloc_one_raw()?;
+                let pb = self.alloc_one_raw()?;
+                self.commit_async().await?;
+
+                let checksum = self.page_checksum_at(pa);
+                self.dir_pages[block_idx].entries[slot] = DirEntry {
+                    in_use: true,
+                    page_a: pa,
+                    page_b: pb,
+                    active_slot: 0,
+                    generation: 0,
+                    checksum,
+                };
+                self.commit_dir_block_async(block_idx).await?;
+
+                return Ok(ProtectedPageId((block_idx * epp + slot) as u64));
+            }
+        }
+
+        // No free slot: need a new directory block pair.
+        if self.dir_blocks.len() >= max_dir_blocks(PAGE_SIZE) {
+            return Err(MappedPageError::DirectoryFull);
+        }
+
+        // Allocate 4 pages at once (2 for dir A/B, 2 for data A/B) in a single commit.
+        let dir_pa = self.alloc_one_raw()?;
+        let dir_pb = self.alloc_one_raw()?;
+        let data_pa = self.alloc_one_raw()?;
+        let data_pb = self.alloc_one_raw()?;
+        self.commit_async().await?;
+
+        let block_idx = self.dir_blocks.len();
+        self.dir_blocks.push(DirBlockRef {
+            page_a: dir_pa,
+            page_b: dir_pb,
+            active: MetaSelector::A,
+        });
+        let mut new_dir_page = DirPage::new_empty(PAGE_SIZE);
+        let checksum = self.page_checksum_at(data_pa);
+        new_dir_page.entries[0] = DirEntry {
+            in_use: true,
+            page_a: data_pa,
+            page_b: data_pb,
+            active_slot: 0,
+            generation: 0,
+            checksum,
+        };
+        self.dir_pages.push(new_dir_page);
+
+        // Write the new directory page (to inactive=B) and update page 0.
+        self.commit_dir_block_async(block_idx).await?;
+
+        Ok(ProtectedPageId((block_idx * epp) as u64))
+    }
+
+    /// Asynchronously free a protected page.
+    ///
+    /// This is the async version of [`free_protected`].
+    #[cfg(feature = "async")]
+    pub async fn free_protected_async(
+        &mut self,
+        id: ProtectedPageId<PAGE_SIZE>,
+    ) -> Result<(), MappedPageError> {
+        let epp = dir_entries_per_page(PAGE_SIZE);
+        let block_idx = id.0 as usize / epp;
+        let slot = id.0 as usize % epp;
+
+        let (pa, pb) = {
+            let entry = self.dir_entry_mut(block_idx, slot)?;
+            if !entry.in_use {
+                return Err(MappedPageError::DoubleFree);
+            }
+            let pa = entry.page_a;
+            let pb = entry.page_b;
+            entry.in_use = false;
+            (pa, pb)
+        };
+
+        // Mark the slot as free in the directory first (crash-safe order).
+        self.commit_dir_block_async(block_idx).await?;
+
+        // Then release the backing pages in normal metadata.
+        self.meta.free_page(pa);
+        self.meta.free_page(pb);
+        self.commit_async().await
+    }
+
+    /// Asynchronously commit directory block changes.
+    /// Note: Currently blocks the async runtime thread.
+    #[cfg(feature = "async")]
+    async fn commit_dir_block_async(&mut self, block_idx: usize) -> Result<(), MappedPageError> {
+        self.commit_dir_block(block_idx)
     }
 
     // ── Metadata accessors ────────────────────────────────────────────────────

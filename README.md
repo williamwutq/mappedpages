@@ -17,6 +17,7 @@ A crash-consistent, memory-mapped, file-backed fixed-size page provider for Rust
 - **Dynamic growth** — the file grows automatically when space is exhausted, with safe recovery if a remap fails mid-grow.
 - **CRC32 checksums** — every metadata page and directory block is protected by a CRC32 checksum.  On open, the library validates both copies and falls back to the alternate if one is corrupt.
 - **Sub-page allocation** — `SubPageAllocator` divides big pages into smaller uniform sub-pages, so callers don't have to implement their own bitmap-based slab allocators on top of the raw pages.
+- **Async I/O support** — async versions of allocation and deallocation methods are available with the "async" feature flag, enabling integration with async runtimes like Tokio.
 
 ## File layout
 
@@ -156,6 +157,45 @@ Recover the inner pager when you are done:
 let pager: Pager<4096> = sub.into_pager();
 ```
 
+### Async I/O Support
+
+Async versions of allocation and deallocation methods are available when the "async" feature is enabled. These methods allow integration with async runtimes like Tokio.
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+mappedpages = { version = "0.1", features = ["async"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+Usage:
+
+```rust
+use mappedpages::Pager;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut pager = Pager::<4096>::create("data.bin")?;
+
+    // Allocate asynchronously
+    let id = pager.alloc_async().await?;
+
+    // Use the page (synchronous access)
+    {
+        let page = id.get_mut(&mut pager)?;
+        page.as_bytes_mut().fill(0xAB);
+    }
+
+    // Free asynchronously
+    pager.free_async(id).await?;
+
+    Ok(())
+}
+```
+
+Note: Currently, the async methods block the async runtime thread due to underlying memory map flush operations. Future versions may provide truly non-blocking async I/O.
+
 ## API
 
 ### `Pager<PAGE_SIZE>`
@@ -168,8 +208,12 @@ The central type.  All page handles hold a borrow on the `Pager` that produced t
 | `open` | `(path) -> Result<Self>` | Open and validate an existing file; fails if the on-disk page size ≠ `PAGE_SIZE` |
 | `alloc` | `(&mut self) -> Result<PageId<PAGE_SIZE>>` | Allocate a regular page; grows the file if needed |
 | `free` | `(&mut self, PageId<PAGE_SIZE>) -> Result<()>` | Free a regular page |
+| `alloc_async` | `(&mut self) -> Result<PageId<PAGE_SIZE>>` | Async version of `alloc` (requires "async" feature) |
+| `free_async` | `(&mut self, PageId<PAGE_SIZE>) -> Result<()>` | Async version of `free` (requires "async" feature) |
 | `alloc_protected` | `(&mut self) -> Result<ProtectedPageId<PAGE_SIZE>>` | Allocate a crash-consistent copy-on-write page |
 | `free_protected` | `(&mut self, ProtectedPageId<PAGE_SIZE>) -> Result<()>` | Free a protected page and both its backing copies |
+| `alloc_protected_async` | `(&mut self) -> Result<ProtectedPageId<PAGE_SIZE>>` | Async version of `alloc_protected` (requires "async" feature) |
+| `free_protected_async` | `(&mut self, ProtectedPageId<PAGE_SIZE>) -> Result<()>` | Async version of `free_protected` (requires "async" feature) |
 | `page_size` | `(&self) -> usize` | Page size in bytes (always equal to `PAGE_SIZE`) |
 | `page_count` | `(&self) -> u64` | Total pages in the file, including reserved pages 0–2 |
 | `free_page_count` | `(&self) -> u64` | Pages currently available for allocation |
