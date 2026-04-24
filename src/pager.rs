@@ -837,7 +837,16 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
         }
         let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
-            ids.push(PageId(self.alloc_one_raw()?));
+            match self.alloc_one_raw() {
+                Ok(id) => ids.push(PageId(id)),
+                Err(e) => {
+                    // Roll back in-memory bitmap changes; no commit has been issued yet.
+                    for id in &ids {
+                        self.meta.free_page(id.0);
+                    }
+                    return Err(e);
+                }
+            }
         }
         self.commit()?;
         Ok(ids)
@@ -897,7 +906,16 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
         }
         let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
-            ids.push(PageId(self.alloc_one_raw()?));
+            match self.alloc_one_raw() {
+                Ok(id) => ids.push(PageId(id)),
+                Err(e) => {
+                    // Roll back in-memory bitmap changes; no commit has been issued yet.
+                    for id in &ids {
+                        self.meta.free_page(id.0);
+                    }
+                    return Err(e);
+                }
+            }
         }
         self.commit_async().await?;
         Ok(ids)
