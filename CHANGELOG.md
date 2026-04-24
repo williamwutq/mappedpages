@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `SubPageAllocator<PARENT_SIZE, SUB_SIZE>` and `SubPageId<PARENT_SIZE, SUB_SIZE>` — a convenience sub-page allocator that divides big pages from an inner `Pager<PARENT_SIZE>` into fixed-size sub-pages of `SUB_SIZE` bytes each. Both types are generic over the same const parameters and integrate with the existing `PageHandle` / `PageAllocator` traits. Up to 64 sub-pages per big page are supported (i.e. `PARENT_SIZE / SUB_SIZE ≤ 64`).
 - Async I/O support — `Pager::alloc_async` and `Pager::free_async` methods for asynchronous page allocation and deallocation, available with the "async" feature flag. Enables integration with async runtimes like Tokio. Note: currently blocks the async runtime thread due to underlying memory map flush operations.
+- **Bulk Operations API** — `Pager::alloc_bulk(count)` allocates multiple pages in a single crash-safe metadata commit, and `Pager::free_bulk(ids)` frees multiple pages in a single commit. All ids passed to `free_bulk` are validated atomically before any state is modified — if any id is reserved, out of bounds, already free, or duplicated, the call returns an error and no pages are freed. Async variants `alloc_bulk_async` and `free_bulk_async` are also available under the "async" feature flag.
+- **Page Iterator** — `Pager::iter_allocated_pages()` returns an `AllocatedPageIter` that traverses the allocation bitmap and yields a `PageId` for every allocated data page, skipping reserved pages 0–2. The iterator holds an immutable borrow on the pager, so allocation and deallocation are statically prevented while it is alive. `AllocatedPageIter` is now a public type exported from the crate root.
 
 ### Changed
 
