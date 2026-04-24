@@ -62,7 +62,12 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
     /// `PAGE_SIZE` must be a power of two and at least 1024; violating either
     /// constraint is a **compile error**.  The file must not already exist.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, MappedPageError> {
-        const { assert!(PAGE_SIZE.is_power_of_two(), "PAGE_SIZE must be a power of two") };
+        const {
+            assert!(
+                PAGE_SIZE.is_power_of_two(),
+                "PAGE_SIZE must be a power of two"
+            )
+        };
         const { assert!(PAGE_SIZE >= 1024, "PAGE_SIZE must be at least 1024") };
 
         let page_size_log2 = PAGE_SIZE.trailing_zeros();
@@ -125,7 +130,12 @@ impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
     /// Protected-page directory blocks are loaded from page 0's extended section
     /// with the same A/B fallback logic.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MappedPageError> {
-        const { assert!(PAGE_SIZE.is_power_of_two(), "PAGE_SIZE must be a power of two") };
+        const {
+            assert!(
+                PAGE_SIZE.is_power_of_two(),
+                "PAGE_SIZE must be a power of two"
+            )
+        };
         const { assert!(PAGE_SIZE >= 1024, "PAGE_SIZE must be at least 1024") };
 
         let file = OpenOptions::new().read(true).write(true).open(path)?;

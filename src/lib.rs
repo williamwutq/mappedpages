@@ -57,6 +57,7 @@ mod meta;
 mod page;
 mod pager;
 mod protected;
+mod sub_allocator;
 #[cfg(test)]
 mod tests;
 
@@ -65,3 +66,4 @@ pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
 pub use pager::Pager;
 pub use protected::{ProtectedPageId, ProtectedPageWriter};
+pub use sub_allocator::{SubPageAllocator, SubPageId};

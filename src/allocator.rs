@@ -90,10 +90,7 @@ impl<const PAGE_SIZE: usize> PageHandle<Pager<PAGE_SIZE>> for ProtectedPageId<PA
     /// to make the write crash-consistent.
     type Mut<'a> = ProtectedPageWriter<'a, PAGE_SIZE>;
 
-    fn get<'a>(
-        &self,
-        pager: &'a Pager<PAGE_SIZE>,
-    ) -> Result<&'a MappedPage, MappedPageError> {
+    fn get<'a>(&self, pager: &'a Pager<PAGE_SIZE>) -> Result<&'a MappedPage, MappedPageError> {
         pager.get_protected_page(*self)
     }
 

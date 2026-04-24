@@ -1334,3 +1334,137 @@ fn crash_old_file_without_dir_section_opens_cleanly() {
     let p = Pager::<1024>::open(tmp.path()).unwrap();
     assert_eq!(p.free_page_count(), 1);
 }
+
+// ── SubPageAllocator tests ────────────────────────────────────────────────────
+
+use crate::{PageAllocator, PageHandle, SubPageAllocator, SubPageId};
+
+#[test]
+fn sub_alloc_basic_alloc_get_free() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let id = sub.alloc().unwrap();
+    assert_eq!(id.get(&sub).unwrap().len(), 512);
+    id.get_mut(&mut sub).unwrap().as_bytes_mut().fill(0xAB);
+    assert!(id.get(&sub).unwrap().as_bytes().iter().all(|&b| b == 0xAB));
+    sub.free(id).unwrap();
+}
+
+#[test]
+fn sub_alloc_fills_one_big_page() {
+    // N = 4096 / 512 = 8 sub-slots per big page.
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    // 8 allocs should all come from a single big page.
+    let ids: Vec<_> = (0..8).map(|_| sub.alloc().unwrap()).collect();
+    let first_slot = ids[0].slot_index;
+    assert!(ids.iter().all(|id| id.slot_index == first_slot));
+    // 9th alloc must trigger a second big-page allocation.
+    let extra = sub.alloc().unwrap();
+    assert_ne!(extra.slot_index, first_slot);
+    sub.free(extra).unwrap();
+    for id in ids {
+        sub.free(id).unwrap();
+    }
+}
+
+#[test]
+fn sub_alloc_auto_grow_second_big_page() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let first_ids: Vec<_> = (0..8).map(|_| sub.alloc().unwrap()).collect();
+    let id_new = sub.alloc().unwrap();
+    assert_ne!(
+        id_new.slot_index, first_ids[0].slot_index,
+        "9th sub-page must come from a different big-page slot"
+    );
+    sub.free(id_new).unwrap();
+    for id in first_ids {
+        sub.free(id).unwrap();
+    }
+}
+
+#[test]
+fn sub_alloc_full_free_returns_big_page() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let free_before = sub.pager().free_page_count();
+    let ids: Vec<_> = (0..8).map(|_| sub.alloc().unwrap()).collect();
+    // One big page consumed.
+    assert!(sub.pager().free_page_count() < free_before + 1);
+    // Free all sub-slots; the big page should be returned to the inner pager.
+    for id in ids {
+        sub.free(id).unwrap();
+    }
+    assert_eq!(sub.pager().free_page_count(), free_before);
+}
+
+#[test]
+fn sub_alloc_double_free_error() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let id = sub.alloc().unwrap();
+    sub.free(id).unwrap();
+    assert!(matches!(sub.free(id), Err(MappedPageError::DoubleFree)));
+}
+
+#[test]
+fn sub_alloc_out_of_bounds_sub_index() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let _live = sub.alloc().unwrap(); // ensure slot 0 exists
+    // sub_index 8 is out of range for N = 8.
+    let bad = SubPageId::<4096, 512>::new_raw(0, 8);
+    assert!(matches!(bad.get(&sub), Err(MappedPageError::OutOfBounds)));
+    assert!(matches!(sub.free(bad), Err(MappedPageError::OutOfBounds)));
+}
+
+#[test]
+fn sub_alloc_slot_reuse_after_full_free() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+    let ids: Vec<_> = (0..8).map(|_| sub.alloc().unwrap()).collect();
+    let first_slot = ids[0].slot_index;
+    for id in ids {
+        sub.free(id).unwrap();
+    }
+    // The tombstone at `first_slot` must be reused by the next alloc.
+    let new_id = sub.alloc().unwrap();
+    assert_eq!(
+        new_id.slot_index, first_slot,
+        "tombstone slot must be reused"
+    );
+}
+
+#[test]
+fn sub_alloc_into_pager() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let sub = SubPageAllocator::<4096, 512>::new(pager);
+    let pager2 = sub.into_pager();
+    assert_eq!(pager2.page_size(), 4096);
+}
+
+#[test]
+fn sub_alloc_n_equals_64() {
+    // PARENT_SIZE / SUB_SIZE = 4096 / 64 = 64 — exercises the full_mask() edge case.
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let mut sub = SubPageAllocator::<4096, 64>::new(pager);
+    let ids: Vec<_> = (0..64).map(|_| sub.alloc().unwrap()).collect();
+    assert_eq!(ids.len(), 64);
+    // 65th alloc must succeed (new big page).
+    let extra = sub.alloc().unwrap();
+    assert_ne!(extra.slot_index, ids[0].slot_index);
+    sub.free(extra).unwrap();
+    for id in ids {
+        sub.free(id).unwrap();
+    }
+}

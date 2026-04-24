@@ -16,10 +16,7 @@ pub struct ProtectedPageId<const PAGE_SIZE: usize>(pub u64);
 
 impl<const PAGE_SIZE: usize> ProtectedPageId<PAGE_SIZE> {
     /// Read the currently active copy of this protected page.
-    pub fn get<'a>(
-        &self,
-        pager: &'a Pager<PAGE_SIZE>,
-    ) -> Result<&'a MappedPage, MappedPageError> {
+    pub fn get<'a>(&self, pager: &'a Pager<PAGE_SIZE>) -> Result<&'a MappedPage, MappedPageError> {
         pager.get_protected_page(*self)
     }
 
