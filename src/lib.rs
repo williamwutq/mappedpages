@@ -34,6 +34,27 @@
 //! — the compiler rejects the mismatch.  `PAGE_SIZE` must be a power of two
 //! and at least 1024; violating either constraint is a compile error.
 //!
+//! # Sub-page allocation
+//!
+//! A `mappedpages` file always has a single, fixed page size — it is written
+//! to the superblock on [`Pager::create`] and validated on every subsequent
+//! [`Pager::open`].  When a workload needs finer granularity than that fixed
+//! size, [`SubPageAllocator`] handles the bookkeeping so callers do not have
+//! to write their own bitmap-based slab allocators on top of raw pages.
+//!
+//! [`SubPageAllocator<PARENT_SIZE, SUB_SIZE>`](SubPageAllocator) wraps a
+//! [`Pager<PARENT_SIZE>`](Pager), checks out big pages as needed, and divides
+//! each one into `PARENT_SIZE / SUB_SIZE` sub-slots (up to 64).  Handles are
+//! [`SubPageId<PARENT_SIZE, SUB_SIZE>`](SubPageId), which implement
+//! [`PageHandle`] and [`PageAllocator`] just like [`PageId`] and
+//! [`ProtectedPageId`].
+//!
+//! **Sub-allocation state is in-memory only.**  The on-disk file is unchanged —
+//! sub-slots live inside the data bytes of ordinary pages, and the free/used
+//! bitmasks are never written to disk.  On process restart, callers must
+//! reconstruct which sub-slots are in use from their own records before
+//! issuing sub-page handles again.
+//!
 //! # Reference lifetime and grow safety
 //!
 //! `&MappedPage` and `&mut MappedPage` are tied to the *borrow* of the `Pager`

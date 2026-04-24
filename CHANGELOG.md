@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SubPageAllocator<PARENT_SIZE, SUB_SIZE>` and `SubPageId<PARENT_SIZE, SUB_SIZE>` — a convenience sub-page allocator that divides big pages from an inner `Pager<PARENT_SIZE>` into fixed-size sub-pages of `SUB_SIZE` bytes each. Both types are generic over the same const parameters and integrate with the existing `PageHandle` / `PageAllocator` traits. Up to 64 sub-pages per big page are supported (i.e. `PARENT_SIZE / SUB_SIZE ≤ 64`).
+
 ### Changed
 
 - `Pager`, `PageId`, `ProtectedPageId`, and `ProtectedPageWriter` are now generic over a const `PAGE_SIZE: usize`. A `PageId<1024>` cannot be passed to a `Pager<4096>` — the compiler rejects the mismatch. This is a source-level breaking change: existing call sites must be updated (see migration note below).

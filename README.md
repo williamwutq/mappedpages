@@ -16,6 +16,7 @@ A crash-consistent, memory-mapped, file-backed fixed-size page provider for Rust
 - **Borrow-checked safety** — `&MappedPage` and `&mut MappedPage` hold a borrow on the `Pager` that produced them. `alloc` and `free` both require `&mut Pager`, so the borrow checker statically prevents accessing a page reference after a remap — a compile error, not a runtime hazard.
 - **Dynamic growth** — the file grows automatically when space is exhausted, with safe recovery if a remap fails mid-grow.
 - **CRC32 checksums** — every metadata page and directory block is protected by a CRC32 checksum.  On open, the library validates both copies and falls back to the alternate if one is corrupt.
+- **Sub-page allocation** — `SubPageAllocator` divides big pages into smaller uniform sub-pages, so callers don't have to implement their own bitmap-based slab allocators on top of the raw pages.
 
 ## File layout
 
@@ -27,6 +28,8 @@ Page 3+ — Data pages   (user-visible, returned by alloc)
 ```
 
 The minimum page size is 1024 bytes; violating this or using a non-power-of-two `PAGE_SIZE` is a compile error.
+
+**The page size is a permanent property of the file.** It is written to the superblock on `create` and validated against `PAGE_SIZE` on every subsequent `open`. All allocation — including sub-page allocation — happens within the data bytes of pages that already have this fixed size on disk.
 
 ## Installation
 
@@ -123,6 +126,36 @@ where
 }
 ```
 
+### Sub-page allocation
+
+The file format always uses a single fixed page size — the size is written to the superblock on `create` and checked on every `open`.  When your workload needs smaller granularity than the on-disk page size, `SubPageAllocator` handles the bookkeeping for you so you don't have to build your own bitmap-based slab allocator on top of raw pages.
+
+`SubPageAllocator<PARENT_SIZE, SUB_SIZE>` wraps a `Pager<PARENT_SIZE>`, divides each big page it checks out into `PARENT_SIZE / SUB_SIZE` sub-slots, and exposes them as `SubPageId` handles that plug into the same `PageHandle` / `PageAllocator` traits.  Up to 64 sub-pages per big page are supported.
+
+**Important:** sub-allocation state is in-memory only.  The on-disk file is unchanged — sub-slots live inside the data bytes of normal pages — but the free/used bitmasks are not written to disk.  On process restart, reconstruct your sub-allocation state from your own records before using sub-page handles again.
+
+```rust
+use mappedpages::{PageAllocator, PageHandle, Pager, SubPageAllocator};
+
+// Wrap a pager; no big pages are checked out yet.
+let pager = Pager::<4096>::create("data.bin")?;
+let mut sub = SubPageAllocator::<4096, 512>::new(pager);
+
+// Each sub-page is 512 bytes; 8 fit in one 4096-byte big page.
+let id = sub.alloc()?;                                   // SubPageId<4096, 512>
+sub.alloc_mut(id)?.as_bytes_mut().fill(0xAB);           // write 512 bytes
+assert_eq!(id.get(&sub)?.len(), 512);
+
+sub.free(id)?;   // when all 8 sub-slots in a big page are freed,
+                 // the big page is returned to the inner pager
+```
+
+Recover the inner pager when you are done:
+
+```rust
+let pager: Pager<4096> = sub.into_pager();
+```
+
 ## API
 
 ### `Pager<PAGE_SIZE>`
@@ -179,9 +212,32 @@ In-progress write to a protected page.  Dropping without `commit` leaves the act
 | `page_mut` | `(&mut self) -> &mut MappedPage` | Mutable view of the page being written |
 | `commit` | `(self) -> Result<()>` | Flush and atomically promote the write to active |
 
+### `SubPageAllocator<PARENT_SIZE, SUB_SIZE>`
+
+Divides big pages from a `Pager<PARENT_SIZE>` into sub-pages of `SUB_SIZE` bytes.  Owns the inner pager.  Sub-allocation state is **in-memory only** — not persisted and not crash-consistent.
+
+Compile-time constraints: `SUB_SIZE` must be a power of two, `PARENT_SIZE` must be divisible by `SUB_SIZE`, `SUB_SIZE < PARENT_SIZE`, and `PARENT_SIZE / SUB_SIZE ≤ 64`.
+
+| Method | Signature | Description |
+|---|---|---|
+| `new` | `(Pager<PARENT_SIZE>) -> Self` | Wrap a pager; no big pages are checked out until the first `alloc` |
+| `alloc` | `(&mut self) -> Result<SubPageId<PARENT_SIZE, SUB_SIZE>>` | Allocate one sub-page; checks out a new big page from the inner pager when needed |
+| `free` | `(&mut self, SubPageId<...>) -> Result<()>` | Free a sub-page; returns the big page to the inner pager when all its sub-slots are free |
+| `pager` | `(&self) -> &Pager<PARENT_SIZE>` | Borrow the inner pager (e.g. to query `page_count`) |
+| `into_pager` | `(self) -> Pager<PARENT_SIZE>` | Consume this allocator and recover the inner pager |
+
+### `SubPageId<PARENT_SIZE, SUB_SIZE>`
+
+Opaque handle to one allocated sub-page.  Cheap to copy.  Can only be used with a `SubPageAllocator` of matching `PARENT_SIZE` and `SUB_SIZE`.
+
+| Method    | Signature                                                              | Description |
+|-----------|------------------------------------------------------------------------|-------------|
+| `get`     | `(&self, &'a SubPageAllocator<...>) -> Result<&'a MappedPage>`         | Immutably borrow the sub-page (`len()` == `SUB_SIZE`) |
+| `get_mut` | `(&self, &'a mut SubPageAllocator<...>) -> Result<&'a mut MappedPage>` | Mutably borrow the sub-page |
+
 ### `PageAllocator` / `PageHandle` traits
 
-`PageHandle<A>` is implemented by `PageId<N>` and `ProtectedPageId<N>` for `A = Pager<N>`.  `PageAllocator<H>` is implemented by `Pager<N>` for both handle types, enabling generic allocator code.
+`PageHandle<A>` is implemented by `PageId<N>`, `ProtectedPageId<N>`, and `SubPageId<P, S>` for their respective allocator types.  `PageAllocator<H>` is implemented by `Pager<N>` for the first two and by `SubPageAllocator<P, S>` for the third, enabling generic allocator code across all three page types.
 
 ## Error handling
 
