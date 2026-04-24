@@ -13,8 +13,8 @@
 //! [16..20] meta_checksum:   u32  (CRC32 of the full active metadata page)
 //! ```
 //!
-//! A file is compatible if its tag is `"MPPG"` and major+minor match; patch
-//! and build may differ (all 0.1.x.x files are mutually compatible).
+//! A file is compatible if its tag is `"MPPG"` and major matches with minor <= current minor; patch
+//! and build may differ (all 0.x.x.x files are mutually compatible).
 //!
 //! On-disk MetaPage layout (fills one page):
 //! ```text
@@ -27,7 +27,7 @@
 
 pub(crate) const MAGIC_TAG: &[u8; 4] = b"MPPG";
 pub(crate) const VERSION_MAJOR: u8 = 0;
-pub(crate) const VERSION_MINOR: u8 = 1;
+pub(crate) const VERSION_MINOR: u8 = 2;
 pub(crate) const VERSION_PATCH: u8 = 0;
 pub(crate) const VERSION_BUILD: u8 = 0;
 /// Full magic for files written by this build: `"MPPG"` + `[major, minor, patch, build]`.
@@ -146,10 +146,10 @@ impl Superblock {
         buf[16..20].copy_from_slice(&self.meta_checksum.to_le_bytes());
     }
 
-    /// Returns true if this file was written by a compatible version (same tag, major, minor).
+    /// Returns true if this file was written by a compatible version (same tag, major, and minor <= current).
     pub(crate) fn is_valid(&self) -> bool {
         let b = self.magic.to_le_bytes();
-        &b[0..4] == MAGIC_TAG && b[4] == VERSION_MAJOR && b[5] == VERSION_MINOR
+        &b[0..4] == MAGIC_TAG && b[4] == VERSION_MAJOR && b[5] <= VERSION_MINOR
     }
 }
 
