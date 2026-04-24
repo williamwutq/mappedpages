@@ -2,7 +2,10 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 
+use crate::concurrent::{ConcurrentPager, ConcurrentPagerError};
 use crate::meta::{
     DirBlockRef, DirEntry, DirPage, FIRST_DATA_PAGE, MAGIC, MetaPage, MetaSelector, Superblock,
     dir_entries_per_page, read_dir_blocks, write_dir_blocks,
@@ -2047,4 +2050,190 @@ fn bulk_protected_free_atomic_no_partial_free_on_error() {
         free_before,
         "no pages should have been freed"
     );
+}
+
+// ── ConcurrentPager tests ─────────────────────────────────────────────────────
+
+#[test]
+fn concurrent_new_and_clone_share_pager() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+    let clone = shared.clone();
+
+    // Allocate through the original, read through the clone.
+    let id = shared.write().unwrap().alloc().unwrap();
+    clone
+        .write()
+        .unwrap()
+        .get_page(id)
+        .expect("page allocated through shared is visible via clone");
+}
+
+#[test]
+fn concurrent_read_guard_deref_gives_pager() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+
+    let id = shared.write().unwrap().alloc().unwrap();
+    let guard = shared.read().unwrap();
+    // The read guard should deref to &Pager and expose get_page.
+    assert!(id.get(&*guard).is_ok());
+}
+
+#[test]
+fn concurrent_write_guard_deref_gives_mut_pager() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+
+    let mut guard = shared.write().unwrap();
+    let id = guard.alloc().unwrap();
+    // Mutable deref: write bytes then verify via shared read.
+    id.get_mut(&mut *guard).unwrap().as_bytes_mut()[0] = 42;
+    drop(guard);
+
+    assert_eq!(shared.read().unwrap().get_page(id).unwrap().as_bytes()[0], 42);
+}
+
+#[test]
+fn concurrent_multiple_readers_simultaneously() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+
+    // Allocate a page and write a known byte.
+    let id = {
+        let mut w = shared.write().unwrap();
+        let id = w.alloc().unwrap();
+        w.get_page_mut(id).unwrap().as_bytes_mut()[0] = 99;
+        id
+    };
+
+    // Spawn N threads, each acquiring a read guard and checking the byte.
+    let shared = Arc::new(shared);
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let s = Arc::clone(&shared);
+            thread::spawn(move || {
+                let guard = s.read().unwrap();
+                guard.get_page(id).unwrap().as_bytes()[0]
+            })
+        })
+        .collect();
+
+    for h in handles {
+        assert_eq!(h.join().unwrap(), 99);
+    }
+}
+
+#[test]
+fn concurrent_write_then_read_across_threads() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = Arc::new(ConcurrentPager::new(pager));
+
+    // Writer thread: allocate a page, write a sentinel.
+    let writer = Arc::clone(&shared);
+    let id = thread::spawn(move || {
+        let mut guard = writer.write().unwrap();
+        let id = guard.alloc().unwrap();
+        guard.get_page_mut(id).unwrap().as_bytes_mut()[0] = 77;
+        id
+    })
+    .join()
+    .unwrap();
+
+    // Reader thread: verify the sentinel is visible.
+    let reader = Arc::clone(&shared);
+    let byte = thread::spawn(move || {
+        let guard = reader.read().unwrap();
+        guard.get_page(id).unwrap().as_bytes()[0]
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(byte, 77);
+}
+
+#[test]
+fn concurrent_try_write_returns_would_block_while_read_held() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+
+    let _read_guard = shared.read().unwrap();
+    let result = shared.try_write();
+    assert!(
+        matches!(result, Err(ConcurrentPagerError::WouldBlock)),
+        "try_write must fail while a read guard is held"
+    );
+}
+
+#[test]
+fn concurrent_try_read_returns_would_block_while_write_held() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+
+    let _write_guard = shared.write().unwrap();
+    let result = shared.try_read();
+    assert!(
+        matches!(result, Err(ConcurrentPagerError::WouldBlock)),
+        "try_read must fail while a write guard is held"
+    );
+}
+
+#[test]
+fn concurrent_into_inner_returns_some_when_sole_owner() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+    assert!(shared.into_inner().is_some());
+}
+
+#[test]
+fn concurrent_into_inner_returns_none_when_clones_exist() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = ConcurrentPager::new(pager);
+    let _clone = shared.clone();
+    assert!(shared.into_inner().is_none());
+}
+
+#[test]
+fn concurrent_from_impl() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared: ConcurrentPager<4096> = pager.into();
+    assert!(shared.read().is_ok());
+}
+
+#[test]
+fn concurrent_protected_page_read_across_threads() {
+    let tmp = TempPath::new();
+    let pager = Pager::<4096>::create(tmp.path()).unwrap();
+    let shared = Arc::new(ConcurrentPager::new(pager));
+
+    // Allocate and write a protected page on the main thread.
+    let pid = {
+        let mut guard = shared.write().unwrap();
+        let pid = guard.alloc_protected().unwrap();
+        let mut writer = pid.get_mut(&mut *guard).unwrap();
+        writer.page_mut().as_bytes_mut()[0] = 55;
+        writer.commit().unwrap();
+        pid
+    };
+
+    // Verify from a worker thread via read guard.
+    let s = Arc::clone(&shared);
+    let byte = thread::spawn(move || {
+        let guard = s.read().unwrap();
+        pid.get(&*guard).unwrap().as_bytes()[0]
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(byte, 55);
 }

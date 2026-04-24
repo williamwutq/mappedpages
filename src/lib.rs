@@ -121,6 +121,7 @@
 //! ```
 
 mod allocator;
+mod concurrent;
 mod error;
 mod meta;
 mod page;
@@ -131,6 +132,7 @@ mod sub_allocator;
 mod tests;
 
 pub use allocator::{BulkPageAllocator, PageAllocator, PageHandle};
+pub use concurrent::{ConcurrentPager, ConcurrentPagerError, PagerReadGuard, PagerWriteGuard};
 pub use error::MappedPageError;
 pub use page::{MappedPage, PageId};
 pub use pager::{AllocatedPageIter, AllocatedProtectedPageIter, Pager};

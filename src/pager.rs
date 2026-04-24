@@ -54,6 +54,15 @@ pub struct Pager<const PAGE_SIZE: usize> {
     dir_pages: Vec<DirPage>,
 }
 
+// Safety: all `&self` methods on `Pager` only read from the memory map — they
+// access `mmap` through `Deref` (`&[u8]`), never through `DerefMut`.  Concurrent
+// reads of the same `&[u8]` region from multiple threads are safe.  `MmapMut` is
+// conservatively `!Sync` because it exposes `DerefMut`, but that path requires
+// `&mut Pager`, which Rust's exclusive-borrow rules prevent from being concurrent.
+// `ConcurrentPager` wraps `Pager` in `RwLock`, providing the ordering guarantees
+// needed for cross-thread write visibility.
+unsafe impl<const PAGE_SIZE: usize> Sync for Pager<PAGE_SIZE> {}
+
 impl<const PAGE_SIZE: usize> Pager<PAGE_SIZE> {
     // ── Construction ──────────────────────────────────────────────────────────
 
