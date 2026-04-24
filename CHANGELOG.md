@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `SubPageAllocator<PARENT_SIZE, SUB_SIZE>` and `SubPageId<PARENT_SIZE, SUB_SIZE>` — a convenience sub-page allocator that divides big pages from an inner `Pager<PARENT_SIZE>` into fixed-size sub-pages of `SUB_SIZE` bytes each. Both types are generic over the same const parameters and integrate with the existing `PageHandle` / `PageAllocator` traits. Up to 64 sub-pages per big page are supported (i.e. `PARENT_SIZE / SUB_SIZE ≤ 64`).
+- Async I/O support — `Pager::alloc_async` and `Pager::free_async` methods for asynchronous page allocation and deallocation, available with the "async" feature flag. Enables integration with async runtimes like Tokio. Note: currently blocks the async runtime thread due to underlying memory map flush operations.
 
 ### Changed
 
