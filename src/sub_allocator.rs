@@ -9,7 +9,7 @@
 //! is not reconstructed when a pager file is reopened.  Callers are responsible
 //! for rebuilding their sub-allocation state after a reopen.
 
-use crate::allocator::{PageAllocator, PageHandle};
+use crate::allocator::{BulkPageAllocator, PageAllocator, PageHandle};
 use crate::error::MappedPageError;
 use crate::page::{MappedPage, PageId};
 use crate::pager::Pager;
@@ -263,6 +263,87 @@ impl<const PARENT_SIZE: usize, const SUB_SIZE: usize>
             // All sub-slots free: set tombstone first, then release the big page.
             let big_id = slot.id;
             *slot_opt = None;
+            self.pager.free(big_id)?;
+        }
+        Ok(())
+    }
+}
+
+// ── BulkPageAllocator impl ──────────────────────────────────────────────────────
+
+impl<const PARENT_SIZE: usize, const SUB_SIZE: usize>
+    BulkPageAllocator<SubPageId<PARENT_SIZE, SUB_SIZE>>
+    for SubPageAllocator<PARENT_SIZE, SUB_SIZE>
+{
+    fn alloc_bulk(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<SubPageId<PARENT_SIZE, SUB_SIZE>>, MappedPageError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            match <Self as PageAllocator<SubPageId<PARENT_SIZE, SUB_SIZE>>>::alloc(self) {
+                Ok(id) => ids.push(id),
+                Err(e) => {
+                    for id in ids.drain(..) {
+                        let _ = <Self as PageAllocator<SubPageId<PARENT_SIZE, SUB_SIZE>>>::free(
+                            self, id,
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    fn free_bulk(
+        &mut self,
+        mut ids: Vec<SubPageId<PARENT_SIZE, SUB_SIZE>>,
+    ) -> Result<(), MappedPageError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        // Sort and detect duplicates before touching any state.
+        ids.sort_unstable();
+        for w in ids.windows(2) {
+            if w[0] == w[1] {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+
+        // Validate every id atomically: bounds check and in-use check.
+        for id in &ids {
+            if id.sub_index as usize >= PARENT_SIZE / SUB_SIZE {
+                return Err(MappedPageError::OutOfBounds);
+            }
+            let slot = self
+                .slots
+                .get(id.slot_index as usize)
+                .ok_or(MappedPageError::OutOfBounds)?;
+            let slot = slot.as_ref().ok_or(MappedPageError::DoubleFree)?;
+            if slot.used & (1u64 << id.sub_index) == 0 {
+                return Err(MappedPageError::DoubleFree);
+            }
+        }
+
+        // All ids are valid: clear their bits and collect big pages that
+        // become fully free so they can be returned to the inner pager.
+        let mut to_release: Vec<PageId<PARENT_SIZE>> = Vec::new();
+        for id in &ids {
+            let slot_opt = &mut self.slots[id.slot_index as usize];
+            let slot = slot_opt.as_mut().unwrap(); // safe: validated above
+            slot.used &= !(1u64 << id.sub_index);
+            if slot.used == 0 {
+                let big_id = slot.id;
+                *slot_opt = None;
+                to_release.push(big_id);
+            }
+        }
+        for big_id in to_release {
             self.pager.free(big_id)?;
         }
         Ok(())

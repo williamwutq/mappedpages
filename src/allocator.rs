@@ -52,6 +52,36 @@ pub trait PageAllocator<AllocatedType: PageHandle<Self>>: Sized {
     fn free(&mut self, id: AllocatedType) -> Result<(), Self::Error>;
 }
 
+/// Extends [`PageAllocator`] with bulk allocation and deallocation.
+///
+/// Not every allocator needs to implement this trait — it exists as a
+/// separate opt-in so that only allocators capable of efficient (or
+/// correct all-or-nothing) bulk operations advertise the capability.
+///
+/// Implementations backed by a [`Pager`] batch the on-disk commit, making
+/// bulk operations significantly more efficient than looping over
+/// [`alloc`](PageAllocator::alloc) / [`free`](PageAllocator::free).
+///
+/// # All-or-nothing semantics
+///
+/// Both methods should validate *all* inputs (or handle all allocations)
+/// before modifying state, and roll back on failure so that no partial
+/// change is visible to the caller.
+pub trait BulkPageAllocator<AllocatedType: PageHandle<Self>>: PageAllocator<AllocatedType> {
+    /// Allocate `count` pages at once, returning a `Vec` of handles.
+    ///
+    /// Returns an empty `Vec` when `count == 0`.  If any allocation fails
+    /// part-way through, already-allocated pages are freed (best-effort)
+    /// before the error is returned.
+    fn alloc_bulk(&mut self, count: usize) -> Result<Vec<AllocatedType>, Self::Error>;
+
+    /// Free multiple pages at once.
+    ///
+    /// Implementations should validate every handle before freeing any,
+    /// so that either all pages are freed or none are (all-or-nothing).
+    fn free_bulk(&mut self, ids: Vec<AllocatedType>) -> Result<(), Self::Error>;
+}
+
 // ── PageId ────────────────────────────────────────────────────────────────────
 
 impl<const PAGE_SIZE: usize> PageHandle<Pager<PAGE_SIZE>> for PageId<PAGE_SIZE> {
@@ -111,5 +141,30 @@ impl<const PAGE_SIZE: usize> PageAllocator<ProtectedPageId<PAGE_SIZE>> for Pager
 
     fn free(&mut self, id: ProtectedPageId<PAGE_SIZE>) -> Result<(), MappedPageError> {
         Pager::free_protected(self, id)
+    }
+}
+
+// ── BulkPageAllocator for Pager ───────────────────────────────────────────────
+
+impl<const PAGE_SIZE: usize> BulkPageAllocator<PageId<PAGE_SIZE>> for Pager<PAGE_SIZE> {
+    fn alloc_bulk(&mut self, count: usize) -> Result<Vec<PageId<PAGE_SIZE>>, MappedPageError> {
+        Pager::alloc_bulk(self, count)
+    }
+
+    fn free_bulk(&mut self, ids: Vec<PageId<PAGE_SIZE>>) -> Result<(), MappedPageError> {
+        Pager::free_bulk(self, ids)
+    }
+}
+
+impl<const PAGE_SIZE: usize> BulkPageAllocator<ProtectedPageId<PAGE_SIZE>> for Pager<PAGE_SIZE> {
+    fn alloc_bulk(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<ProtectedPageId<PAGE_SIZE>>, MappedPageError> {
+        Pager::alloc_protected_bulk(self, count)
+    }
+
+    fn free_bulk(&mut self, ids: Vec<ProtectedPageId<PAGE_SIZE>>) -> Result<(), MappedPageError> {
+        Pager::free_protected_bulk(self, ids)
     }
 }
