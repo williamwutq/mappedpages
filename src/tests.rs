@@ -1,8 +1,8 @@
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use crate::concurrent::{ConcurrentPager, ConcurrentPagerError};
@@ -2094,7 +2094,10 @@ fn concurrent_write_guard_deref_gives_mut_pager() {
     id.get_mut(&mut *guard).unwrap().as_bytes_mut()[0] = 42;
     drop(guard);
 
-    assert_eq!(shared.read().unwrap().get_page(id).unwrap().as_bytes()[0], 42);
+    assert_eq!(
+        shared.read().unwrap().get_page(id).unwrap().as_bytes()[0],
+        42
+    );
 }
 
 #[test]
