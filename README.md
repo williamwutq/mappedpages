@@ -17,6 +17,7 @@ A crash-consistent, memory-mapped, file-backed fixed-size page provider for Rust
 - **Dynamic growth** — the file grows automatically when space is exhausted, with safe recovery if a remap fails mid-grow.
 - **CRC32 checksums** — every metadata page and directory block is protected by a CRC32 checksum.  On open, the library validates both copies and falls back to the alternate if one is corrupt.
 - **Sub-page allocation** — `SubPageAllocator` divides big pages into smaller uniform sub-pages, so callers don't have to implement their own bitmap-based slab allocators on top of the raw pages.  Implements `BulkPageAllocator` for sub-pages, so `alloc_bulk` and `free_bulk` work there too.
+- **Concurrent access** — `ConcurrentPager<PAGE_SIZE>` wraps a `Pager` in an `Arc<RwLock<…>>` and is `Clone`, `Send`, and `Sync`. Multiple threads can hold a shared `PagerReadGuard` simultaneously for concurrent page reads; a `PagerWriteGuard` provides exclusive mutable access for allocation and mutation. Both guards dereference to the inner `Pager`, so the full existing API is available through them without any adapter methods.
 - **Async I/O support** — async versions of allocation and deallocation methods are available with the "async" feature flag, enabling integration with async runtimes like Tokio.
 - **Bulk operations** — `alloc_bulk(count)` and `free_bulk(ids)` allocate or free multiple regular pages in a single crash-safe metadata commit. `alloc_protected_bulk` and `free_protected_bulk` provide the same convenience for protected pages. `SubPageAllocator` also supports `alloc_bulk`/`free_bulk`. All `free_bulk` variants validate all ids atomically so no partial state change occurs on error. The `BulkPageAllocator` trait lets generic code require this capability with a single where-bound.
 - **Page iterators** — `iter_allocated_pages()` returns an `AllocatedPageIter` over regular data pages (internal protected-page resources are excluded). `iter_allocated_protected_pages()` returns an `AllocatedProtectedPageIter` over in-use protected pages. The two iterators are strictly disjoint: neither leaks the other's pages.
@@ -172,6 +173,50 @@ Recover the inner pager when you are done:
 ```rust
 let pager: Pager<4096> = sub.into_pager();
 ```
+
+### Concurrent access
+
+`ConcurrentPager<PAGE_SIZE>` wraps a `Pager` in an `Arc<RwLock<…>>` so the same pager can be shared and accessed safely across multiple threads.
+
+```rust
+use mappedpages::{Pager, ConcurrentPager};
+use std::sync::Arc;
+use std::thread;
+
+let pager = Pager::<4096>::create("data.bin")?;
+let shared = Arc::new(ConcurrentPager::new(pager));
+
+// Writer thread: allocate a page and write a sentinel byte.
+let w = Arc::clone(&shared);
+let page_id = thread::spawn(move || {
+    let mut guard = w.write().unwrap();
+    let id = guard.alloc().unwrap();
+    guard.get_page_mut(id).unwrap().as_bytes_mut()[0] = 42;
+    id
+}).join().unwrap();
+
+// Multiple reader threads access different pages simultaneously.
+let handles: Vec<_> = (0..4).map(|_| {
+    let r = Arc::clone(&shared);
+    thread::spawn(move || {
+        let guard = r.read().unwrap();
+        guard.get_page(page_id).unwrap().as_bytes()[0]
+    })
+}).collect();
+
+for h in handles {
+    assert_eq!(h.join().unwrap(), 42);
+}
+```
+
+Key points:
+
+- **`read()`** blocks until no writer holds the lock; multiple threads can hold read guards simultaneously.
+- **`write()`** blocks until all readers and any other writer have released their locks.
+- **`try_read()` / `try_write()`** return `Err(WouldBlock)` immediately instead of blocking.
+- **`into_inner()`** recovers the inner `Pager` when this is the last remaining clone.
+- **`Clone`** — all clones share the same underlying `Pager`.
+- Existing single-threaded code using `Pager` directly is unchanged.
 
 ### Async I/O Support
 
@@ -374,6 +419,36 @@ Opaque handle to one allocated sub-page.  Cheap to copy.  Can only be used with 
 |-----------|------------------------------------------------------------------------|-------------|
 | `get`     | `(&self, &'a SubPageAllocator<...>) -> Result<&'a MappedPage>`         | Immutably borrow the sub-page (`len()` == `SUB_SIZE`) |
 | `get_mut` | `(&self, &'a mut SubPageAllocator<...>) -> Result<&'a mut MappedPage>` | Mutably borrow the sub-page |
+
+### `ConcurrentPager<PAGE_SIZE>`
+
+Thread-safe, reference-counted wrapper around `Pager<PAGE_SIZE>`.  `Clone`; all clones share the same underlying pager.  `Send + Sync`.
+
+| Method | Signature | Description |
+|---|---|---|
+| `new` | `(Pager<PAGE_SIZE>) -> Self` | Wrap a pager in an `Arc<RwLock<…>>` |
+| `read` | `(&self) -> Result<PagerReadGuard<'_, PAGE_SIZE>, ConcurrentPagerError>` | Acquire a shared read lock (blocks until no writer holds it) |
+| `write` | `(&self) -> Result<PagerWriteGuard<'_, PAGE_SIZE>, ConcurrentPagerError>` | Acquire an exclusive write lock (blocks until all other locks are released) |
+| `try_read` | `(&self) -> Result<PagerReadGuard<'_, PAGE_SIZE>, ConcurrentPagerError>` | Non-blocking read lock; returns `WouldBlock` if a writer holds the lock |
+| `try_write` | `(&self) -> Result<PagerWriteGuard<'_, PAGE_SIZE>, ConcurrentPagerError>` | Non-blocking write lock; returns `WouldBlock` if any lock is held |
+| `into_inner` | `(self) -> Option<Pager<PAGE_SIZE>>` | Recover the inner `Pager` if this is the last clone; `None` if other clones exist |
+
+### `PagerReadGuard<'_, PAGE_SIZE>`
+
+Shared read guard returned by `ConcurrentPager::read` / `try_read`.  Derefs to `&Pager<PAGE_SIZE>`, exposing all read-only `Pager` methods.  Multiple guards may be held simultaneously across threads.  Released on drop.
+
+### `PagerWriteGuard<'_, PAGE_SIZE>`
+
+Exclusive write guard returned by `ConcurrentPager::write` / `try_write`.  Derefs to `&mut Pager<PAGE_SIZE>`, exposing all `Pager` methods including `alloc`, `free`, and mutable page access.  Only one may exist at a time.  Released on drop.
+
+### `ConcurrentPagerError`
+
+Error type for `ConcurrentPager` locking operations.
+
+| Variant | Meaning |
+|---|---|
+| `Poisoned` | A thread panicked while holding the write lock |
+| `WouldBlock` | `try_read` / `try_write` failed because the lock is currently held |
 
 ### `PageAllocator` / `BulkPageAllocator` / `PageHandle` traits
 

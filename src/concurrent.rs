@@ -83,7 +83,9 @@ impl<T> From<PoisonError<T>> for ConcurrentPagerError {
 
 /// A thread-safe, reference-counted wrapper around [`Pager`].
 ///
-/// See the [module documentation](self) for usage details and examples.
+/// Wraps a [`Pager`] in an `Arc<RwLock<…>>` so it can be shared across
+/// threads.  See the [crate-level documentation](crate#concurrent-access) for
+/// a full description and example.
 pub struct ConcurrentPager<const PAGE_SIZE: usize> {
     inner: Arc<RwLock<Pager<PAGE_SIZE>>>,
 }

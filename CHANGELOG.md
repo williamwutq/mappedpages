@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Concurrent access** — `ConcurrentPager<PAGE_SIZE>` wraps a `Pager` in an
+  `Arc<RwLock<…>>` and is `Clone`, `Send`, and `Sync`.  `read()` acquires a
+  shared `PagerReadGuard` (multiple threads may hold one simultaneously);
+  `write()` acquires an exclusive `PagerWriteGuard` (no concurrent readers or
+  writers).  Both guards dereference to the inner `Pager`, exposing the full
+  existing API without adapter methods.  Non-blocking `try_read` / `try_write`
+  variants and `into_inner` (recovers the `Pager` when the last clone is dropped)
+  are also provided.  `ConcurrentPagerError` covers `Poisoned` (a thread panicked
+  while holding the lock) and `WouldBlock` (non-blocking try variants).
+  Backward-compatible: the existing `Pager` API is unchanged; `ConcurrentPager`
+  is purely opt-in.
+
 ## [0.2.0] - 2026-04-24
 
 ### Added

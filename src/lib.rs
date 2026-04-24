@@ -103,6 +103,41 @@
 //! by [`SubPageAllocator`] for `SubPageId`.  Generic code can require bulk
 //! capability with a `where A: BulkPageAllocator<H>` bound.
 //!
+//! # Concurrent access
+//!
+//! [`ConcurrentPager<PAGE_SIZE>`](ConcurrentPager) wraps a [`Pager`] in an
+//! `Arc<RwLock<…>>` so the same pager can be shared and used safely across
+//! multiple threads.
+//!
+//! - **Shared reads** — [`ConcurrentPager::read`] acquires a [`PagerReadGuard`]
+//!   that derefs to `&Pager`.  Multiple threads can hold read guards
+//!   simultaneously, accessing different pages in parallel.
+//! - **Exclusive writes** — [`ConcurrentPager::write`] acquires a
+//!   [`PagerWriteGuard`] that derefs to `&mut Pager`, giving access to
+//!   `alloc`, `free`, and all mutable page methods.  No readers or other
+//!   writers may hold a lock concurrently.
+//! - **Non-blocking variants** — [`try_read`](ConcurrentPager::try_read) and
+//!   [`try_write`](ConcurrentPager::try_write) return
+//!   [`ConcurrentPagerError::WouldBlock`] immediately if the lock is unavailable.
+//!
+//! `ConcurrentPager` is `Clone`; all clones share the same underlying `Pager`.
+//! It is `Send + Sync`.  The existing single-threaded `Pager` API is unchanged.
+//!
+//! ```rust,no_run
+//! # use mappedpages::{Pager, ConcurrentPager};
+//! # use std::sync::Arc;
+//! let pager = Pager::<4096>::create("data.bin").unwrap();
+//! let shared = Arc::new(ConcurrentPager::new(pager));
+//!
+//! let id = shared.write().unwrap().alloc().unwrap();
+//!
+//! let r = Arc::clone(&shared);
+//! std::thread::spawn(move || {
+//!     let guard = r.read().unwrap();
+//!     let _ = id.get(&*guard).unwrap();
+//! }).join().unwrap();
+//! ```
+//!
 //! # Reference lifetime and grow safety
 //!
 //! `&MappedPage` and `&mut MappedPage` are tied to the *borrow* of the `Pager`
